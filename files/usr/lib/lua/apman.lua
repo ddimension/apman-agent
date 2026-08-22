@@ -297,6 +297,29 @@ end
 
 -- merge the assoclist of 'device' into 'target', tagging every entry with the
 -- interface it was seen on (VLAN slaves report their own device)
+-- the same merge, but the list arrives later; target is a table that already
+-- exists so the caller can hand it around before it is filled
+function apman.merge_assoclist_into(holder, key, device, cb)
+	apman.ubus_call("iwinfo", "assoclist", { device = device }, function(list)
+		if type(list) == 'table' and type(list['results']) == 'table' then
+			for _, entry in pairs(list['results']) do
+				if type(entry) == 'table' then
+					entry['device'] = device
+				end
+			end
+			local target = holder[key]
+			if type(target) ~= 'table' or type(target['results']) ~= 'table' then
+				holder[key] = list
+			else
+				for _, entry in pairs(list['results']) do
+					table.insert(target['results'], entry)
+				end
+			end
+		end
+		cb()
+	end)
+end
+
 function apman.merge_assoclist(target, device)
 	local list = apman.conn:call("iwinfo", "assoclist", { device = device })
 	if type(list) ~= 'table' or type(list['results']) ~= 'table' then
@@ -461,6 +484,19 @@ function apman.parse_iwinfo(text)
 end
 
 function apman.status_cycle()
+	-- A tick that arrives while the previous one is still collecting is
+	-- dropped, not queued. Two cycles in flight would publish two documents
+	-- for the same interface in an order nobody controls, and the older one
+	-- could land last. Skipping says so in the log; if it says so often, the
+	-- collection has become slower than the interval and that is the thing to
+	-- fix, not the symptom.
+	if apman.status_busy then
+		print('status cycle still collecting, skipping this tick')
+
+		return
+	end
+	apman.status_busy = true
+
 	local topic, data
 	local devices = apman.conn:call("iwinfo", "devices", {})
 	data = {}
@@ -528,22 +564,54 @@ function apman.status_cycle()
 		end
 	end
 
+	-- The gathering, asynchronously.
+	--
+	-- Four kinds of ubus call per interface — get_clients, the assoclist of
+	-- the master and of every vlan slave, network.device status, get_status.
+	-- Measured on an access point with eleven of them: 79 ms in which nothing
+	-- else in this process ran, every ten seconds. They go out together now
+	-- and the uloop keeps turning while the answers come back; nothing here
+	-- depends on their order, every answer lands in its own slot.
+	--
+	-- Everything after this waits for the last of them, in finish() below.
+	local pending, listed = 0, false
+	local finish
+	local function landed()
+		pending = pending - 1
+		if listed and pending == 0 then
+			finish()
+		end
+	end
 	for key, value in pairs(masters) do
 		data['devices'][value] = {}
-		data['devices'][value]['timestamp'] = socket.gettime()
-		data['devices'][value]['info'] = iwinfo[value]
-		data['devices'][value]['clients'] = apman.conn:call("hostapd."..value, "get_clients", {})
-		data['devices'][value]['assoclist'] = apman.merge_assoclist(nil, value)
+		local dev = data['devices'][value]
+		dev['timestamp'] = socket.gettime()
+		dev['info'] = iwinfo[value]
+		if type(hostapd_status) == 'table' and type(hostapd_status['interfaces']) == 'table' then
+			dev['hostapd_status'] = hostapd_status['interfaces'][value]
+		end
+		pending = pending + 1
+		apman.ubus_call("hostapd."..value, "get_clients", {}, function(r)
+			dev['clients'] = r
+			landed()
+		end)
+		pending = pending + 1
+		apman.ubus_call("network.device", "status", { name = value }, function(r)
+			dev['status'] = r
+			landed()
+		end)
+		pending = pending + 1
+		apman.ubus_call("hostapd."..value, "get_status", {}, function(r)
+			dev['ap_status'] = r
+			landed()
+		end)
+		pending = pending + 1
+		apman.merge_assoclist_into(dev, 'assoclist', value, landed)
 		if slaves[value] ~= nil then
 			for k2, subdevice in pairs(slaves[value]) do
-				--print('queried slave '..subdevice)
-				data['devices'][value]['assoclist'] = apman.merge_assoclist(data['devices'][value]['assoclist'], subdevice)
+				pending = pending + 1
+				apman.merge_assoclist_into(dev, 'assoclist', subdevice, landed)
 			end
-		end
-		data['devices'][value]['status'] = apman.conn:call("network.device", "status", { name = value })
-		data['devices'][value]['ap_status'] = apman.conn:call("hostapd."..value, "get_status", {})
-		if type(hostapd_status) == 'table' and type(hostapd_status['interfaces']) == 'table' then
-			data['devices'][value]['hostapd_status'] = hostapd_status['interfaces'][value]
 		end
 		-- dump every interface, not only those with entries in the assoclist:
 		-- p2p/mesh peers never show up there
@@ -557,6 +625,7 @@ function apman.status_cycle()
 		end
 	end
 
+	function finish()
 	local dumps = {}
 	if apman.station_dump then
 		dumps = apman.collect_station_dumps(dumpdevs)
@@ -641,6 +710,16 @@ function apman.status_cycle()
 	-- Cheap: publish_property compares first, so a tick that changed nothing
 	-- sends nothing.
 	apman.publish_radius()
+	apman.status_busy = false
+	end
+
+	-- set after every request is out: without the async binding each callback
+	-- above has already run inline, and pending would have touched zero
+	-- between two interfaces
+	listed = true
+	if pending == 0 then
+		finish()
+	end
 end
 
 -- reconnect from the ubus poll timer: a transient ubus failure must not kill
