@@ -17,6 +17,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 FEED_DEFAULT="$(dirname "$ROOT")/ddimension-openwrt-repo"
+# der buildroot liefert das tar, mit dem der hash berechnet werden muss
+OPENWRT_ROOT="${APMAN_OPENWRT:-/vol/release/chateau/openwrt}"
 
 MSG=""
 DEVS=()
@@ -190,11 +192,22 @@ fi
 # Die feste mtime aus der Commit-Zeit ist der Grund, warum derselbe Commit
 # immer denselben Hash ergibt. Wer das nicht glaubt: zweimal laufen lassen.
 #
+# Und es muss das tar des Buildroots sein, nicht das des Systems. OpenWrts
+# host-tar schreibt bei einem GNU-@LongLink-Header (jeder Pfad ueber 100
+# Zeichen) root/root in uname/gname, das System-tar laesst sie leer — gleiche
+# Versionsnummer, anderer Build. Bei apman faellt das nicht auf, weil kein
+# Pfad so lang ist; bei libubus-lua-async schlug genau daran der erste Build
+# fehl. Deshalb $TAR unten: liegt ein Buildroot da, gilt dessen tar.
+#
 # Geprueft, nicht angenommen: dieselben Schritte auf rtl826x-firmware
 # (PKG_SOURCE_DATE 2026-01-24) ergeben exakt den PKG_MIRROR_HASH aus dessen
-# Makefile im Upstream-Baum. Aeltere Tarballs auf sources.openwrt.org stammen
-# noch aus der xz-Zeit und wurden spaeter umgepackt — die taugen nicht als
-# Referenz, ihr Hash ist mit keinem zstd von heute zu treffen.
+# Makefile im Upstream-Baum — aber auch dort ist kein Pfad lang genug, die
+# Pruefung sagte also weniger als sie schien. Aeltere Tarballs auf
+# sources.openwrt.org stammen noch aus der xz-Zeit und wurden spaeter
+# umgepackt; die taugen ohnehin nicht als Referenz.
+#
+# Im Zweifel entscheidet der Buildroot: 'make package/<name>/download' meldet
+# den erwarteten und den erzeugten Hash im Klartext.
 # --------------------------------------------------------------------------
 say "mirror-hash berechnen"
 PKG_NAME=apman
@@ -202,6 +215,14 @@ SUBDIR="$PKG_NAME-$NEW_VER"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+TAR=tar
+if [ -x "$OPENWRT_ROOT/staging_dir/host/bin/tar" ]; then
+	TAR="$OPENWRT_ROOT/staging_dir/host/bin/tar"
+	echo "tar aus dem buildroot: $TAR"
+else
+	echo "WARNUNG: kein buildroot unter $OPENWRT_ROOT — system-tar, der hash"
+	echo "         kann abweichen, sobald ein pfad laenger als 100 zeichen ist"
+fi
 (
 	# umask 022 um ALLES, und beim Auspacken KEIN -p. Das ist nicht Kosmetik:
 	# `git archive` schreibt die Dateimodi durch die umask (mit 002 werden aus
@@ -217,8 +238,10 @@ trap 'rm -rf "$TMP"' EXIT
 	git -C "$TMP/$SUBDIR" archive --format=tar HEAD --output="$TMP/$SUBDIR.tar.git"
 	rm -rf "$TMP/$SUBDIR"; mkdir "$TMP/$SUBDIR"
 	tar -C "$TMP/$SUBDIR" -xf "$TMP/$SUBDIR.tar.git"
-	cd "$TMP" && tar --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
-		--mtime="$TAR_TIMESTAMP" -c "$SUBDIR" | zstd -T0 --ultra -20 -q -o "$TMP/$SUBDIR.tar.zst"
+	# gepipet, nicht als datei: mit bekannter groesse schreibt zstd die
+	# unkomprimierte laenge in den frame-header und die bytes weichen ab
+	cd "$TMP" && "$TAR" --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
+		--mtime="$TAR_TIMESTAMP" -c "$SUBDIR" | zstd -T0 --ultra -20 -c > "$TMP/$SUBDIR.tar.zst"
 )
 HASH="$(sha256sum "$TMP/$SUBDIR.tar.zst" | cut -d' ' -f1)"
 echo "tarball: $SUBDIR.tar.zst  ($(stat -c%s "$TMP/$SUBDIR.tar.zst") bytes)"
