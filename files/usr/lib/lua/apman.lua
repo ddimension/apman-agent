@@ -554,6 +554,19 @@ function apman.status_cycle()
 		apman.publish_mqtt( topic , cjson.encode(data))
 	end
 
+	-- Every tick, not only when something reconnects.
+	--
+	-- This was published from the connect and resubscribe paths alone, so the
+	-- request counters, the last decision and the newest error froze a few
+	-- seconds after the agent started and never moved again. The page built on
+	-- it showed a snapshot of boot and looked like a radius server nobody was
+	-- asking — while the controller's own radius_auth table proved requests
+	-- were arriving the whole time. Found by the controller side noticing the
+	-- timestamp was eight seconds after start and had not moved since.
+	--
+	-- Cheap: publish_property compares first, so a tick that changed nothing
+	-- sends nothing.
+	apman.publish_radius()
 end
 
 -- reconnect from the ubus poll timer: a transient ubus failure must not kill
@@ -1332,12 +1345,13 @@ function apman.publish_radius()
 		}
 	end
 	info.hostname = apman.hostname
-	info.ts = socket.gettime()
-	-- ts changes on every call, so the payload always differs and
-	-- publish_property would lose its point: compare without it
+	-- encoded before the timestamp goes in, and handed to publish_property as
+	-- the comparison value. Otherwise ts alone would make every tick look like
+	-- a change — the comment said so before, the code did not do it.
 	local compare = cjson.encode(info)
-	apman.publish_property(apman.ap_topic('properties/radius'), compare,
-		1, true, apman.property_republish)
+	info.ts = socket.gettime()
+	apman.publish_property(apman.ap_topic('properties/radius'), cjson.encode(info),
+		1, true, apman.property_republish, compare)
 end
 
 -- per channel noise and busy time, the input a controller needs for fleet wide
@@ -1365,16 +1379,21 @@ end
 -- publishes only when the payload changed or the last publish is older than
 -- max_age. Retained topics keep working for late subscribers, and a consumer
 -- that lost its state resyncs within max_age.
-function apman.publish_property(topic, payload, qos, retain, max_age)
+-- compare is what decides whether this is "the same as last time"; without it
+-- the payload itself does. They differ whenever the payload carries a
+-- timestamp: that changes on every call, so the comparison would never match
+-- and a retained property would be republished on every tick.
+function apman.publish_property(topic, payload, qos, retain, max_age, compare)
+	compare = compare or payload
 	local last = apman.published[topic]
-	if last ~= nil and last.payload == payload then
+	if last ~= nil and last.payload == compare then
 		if max_age == nil or (socket.gettime() - last.ts) < max_age then
 			return true
 		end
 	end
 	local result = apman.publish_mqtt(topic, payload, qos, retain)
 	if result ~= nil then
-		apman.published[topic] = { payload = payload, ts = socket.gettime() }
+		apman.published[topic] = { payload = compare, ts = socket.gettime() }
 	end
 	return result
 end
