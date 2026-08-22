@@ -631,6 +631,84 @@ function apman.ubus_call(object, method, args, cb, timeout)
 	return false
 end
 
+-- The queue: asynchronous, but strictly one at a time.
+--
+-- Deferring every incoming call would be wrong. Inside a bulk the commands run
+-- in the order they were sent and the controller depends on it — uci add, uci
+-- commit, reload is a sequence, not a set. Deferring them independently would
+-- let a commit overtake the add that fills it, rarely and unreproducibly.
+--
+-- So the order is kept by the queue instead of by blocking: exactly one
+-- request is in flight, the next starts when it lands, and in between the
+-- uloop runs. Everything the blocking call used to stop — the mqtt client, the
+-- control channel monitors, the radius server — keeps working, and the caller
+-- still sees its commands executed in the order it sent them.
+--
+-- Without the async binding this is a straight pass through to the blocking
+-- call, which is already sequential. Same behaviour, one less indirection.
+apman.ubus_q = { head = 1, tail = 0, items = {}, busy = false }
+-- A producer gone wrong must not eat the heap, but the limit has to clear the
+-- real batches by a wide margin: assigning neighbour reports to every bss of
+-- this access point is one bulk of 34 commands, measured, and a bigger site
+-- sends more. An entry is a handful of pointers; 256 costs nothing and turning
+-- away a provisioning command would cost a lot.
+apman.ubus_q_max = 256
+apman.ubus_q_high = 0            -- deepest the queue has been, for the status
+
+function apman.ubus_queue_depth()
+	return apman.ubus_q.tail - apman.ubus_q.head + 1
+end
+
+function apman.ubus_queue(object, method, args, cb, timeout)
+	if not apman.have_ubus_async then
+		return apman.ubus_call(object, method, args, cb, timeout)
+	end
+	local q = apman.ubus_q
+	if apman.ubus_queue_depth() >= apman.ubus_q_max then
+		-- refused, not dropped: a command that is never answered is worse
+		-- than one that is answered with a reason
+		print(string.format('ubus queue full (%d), refusing %s %s',
+			apman.ubus_q_max, tostring(object), tostring(method)))
+		cb(nil, 11, 'queue')
+
+		return false
+	end
+	q.tail = q.tail + 1
+	q.items[q.tail] = { object = object, method = method, args = args,
+		cb = cb, timeout = timeout }
+	local depth = apman.ubus_queue_depth()
+	if depth > apman.ubus_q_high then
+		apman.ubus_q_high = depth
+	end
+	apman.ubus_queue_pump()
+
+	return true
+end
+
+function apman.ubus_queue_pump()
+	local q = apman.ubus_q
+	if q.busy then
+		return
+	end
+	local item = q.items[q.head]
+	if item == nil then
+		return
+	end
+	q.items[q.head] = nil
+	q.head = q.head + 1
+	q.busy = true
+	apman.ubus_call(item.object, item.method, item.args, function(result, status, stage)
+		q.busy = false
+		-- pcall: this runs from a uloop callback, and an error thrown out of a
+		-- consumer would take the pump with it and stall every later command
+		local ok, err = pcall(item.cb, result, status, stage)
+		if not ok then
+			print(string.format('ubus queue consumer failed: %s', tostring(err)))
+		end
+		apman.ubus_queue_pump()
+	end, item.timeout)
+end
+
 function apman.mqtt_log(level, message)
 	-- print('mosquitto ' .. level .. ':' .. message)
 end
@@ -1098,6 +1176,52 @@ function apman.execute_rpc(cmd, done)
 		args = {}
 	end
 
+	-- the caller may set its own deadline; clamped so a typo cannot pin a
+	-- request open for a day or make it expire before it was sent
+	local timeout = tonumber(cmd['timeout'])
+	if timeout ~= nil then
+		timeout = math.max(1, math.min(300, math.floor(timeout)))
+	end
+
+	-- One place that turns a ubus answer into the response, so the queued, the
+	-- deferred and the blocking path cannot drift apart while all three exist.
+	local function fill(tag, result, status, stage)
+		if result == nil and type(status) == 'number' and status ~= 0 then
+			response['error'] = {
+				code = status,
+				message = apman.ubus_status_text[status] or 'ubus error',
+				object = object,
+				method = method,
+				-- only set when the call never reached ubus; absent means
+				-- this is what the object itself answered
+				stage = stage,
+			}
+			print(string.format("call (%s) %s %s failed: %s (%d)",
+				tag, object, method, response['error'].message, status))
+		else
+			response['result'] = result
+			response['ubus_status'] = 0
+			print(string.format("call (%s) %s %s ok: %s",
+				tag, object, method, apman.trunc(cjson.encode(result))))
+		end
+		response['ts'] = socket.gettime()
+		response[tag] = true
+
+		return response
+	end
+
+	-- the same, delivered: for the paths whose answer arrives later
+	local function answer(tag)
+		return function(result, status, stage)
+			fill(tag, result, status, stage)
+			if done ~= nil then
+				done(response)
+			else
+				apman.publish_rpc_response(response)
+			end
+		end
+	end
+
 	-- The same call, answered later.
 	--
 	-- 'call' stays blocking on purpose: inside a bulk the commands run in the
@@ -1112,42 +1236,10 @@ function apman.execute_rpc(cmd, done)
 
 			return response
 		end
-		-- the caller may set its own deadline; clamped so a typo cannot pin a
-		-- request open for a day or make it expire before it was sent
-		local timeout = tonumber(cmd['timeout'])
-		if timeout ~= nil then
-			timeout = math.max(1, math.min(300, math.floor(timeout)))
-		end
 		print(string.format("calling (async%s) %s %s with %s",
 			timeout and (' ' .. timeout .. 's') or '', object, method,
 			apman.trunc(cjson.encode(args))))
-		apman.ubus_call(object, method, args, function(result, status, stage)
-			if result == nil and type(status) == 'number' and status ~= 0 then
-				response['error'] = {
-					code = status,
-					message = apman.ubus_status_text[status] or 'ubus error',
-					object = object,
-					method = method,
-					-- only set when the call never reached ubus; absent means
-					-- this is what the object itself answered
-					stage = stage,
-				}
-				print(string.format("call (async) %s %s failed: %s (%d)",
-					object, method, response['error'].message, status))
-			else
-				response['result'] = result
-				response['ubus_status'] = 0
-				print(string.format("call (async) %s %s ok: %s",
-					object, method, apman.trunc(cjson.encode(result))))
-			end
-			response['ts'] = socket.gettime()
-			response['async'] = true
-			if done ~= nil then
-				done(response)
-			else
-				apman.publish_rpc_response(response)
-			end
-		end, timeout)
+		apman.ubus_call(object, method, args, answer('async'), timeout)
 
 		return nil
 	end
@@ -1178,23 +1270,29 @@ function apman.execute_rpc(cmd, done)
 		end
 		return response
 	end
-	print(string.format("calling %s %s with %s", object, method, apman.trunc(cjson.encode(args))))
+	-- 'call' keeps its promise — the commands of a bulk are executed in the
+	-- order they were sent — but it keeps it through the queue now instead of
+	-- by stopping the process. One request in flight, the next when it lands,
+	-- the uloop running in between.
+	--
+	-- The blocking path stays for access points without the async binding.
+	-- Both are here on purpose while the two are compared: the response of the
+	-- queued path carries "queued": true, the blocking one carries nothing, so
+	-- which one answered is visible on the wire. When they have been the same
+	-- for long enough, the blocking one goes.
+	if apman.have_ubus_async then
+		print(string.format("calling (queued%s, depth %d) %s %s with %s",
+			timeout and (' ' .. timeout .. 's') or '', apman.ubus_queue_depth() + 1,
+			object, method, apman.trunc(cjson.encode(args))))
+		apman.ubus_queue(object, method, args, answer('queued'), timeout)
 
-	local result, status = apman.conn:call(object, method, args)
-	if result == nil and type(status) == 'number' and status ~= 0 then
-		response['error'] = {
-			code = status,
-			message = apman.ubus_status_text[status] or 'ubus error',
-			object = object,
-			method = method,
-		}
-		print(string.format("call %s %s failed: %s (%d)", object, method, response['error'].message, status))
-	else
-		response['result'] = result
-		response['ubus_status'] = 0
-		print(string.format("call %s %s ok: %s", object, method, apman.trunc(cjson.encode(result))))
+		return nil
 	end
-	return response
+
+	print(string.format("calling %s %s with %s", object, method, apman.trunc(cjson.encode(args))))
+	local result, status = apman.conn:call(object, method, args)
+
+	return fill('sync', result, status)
 end
 
 -- correlation topic, so several commands in flight do not overwrite each
@@ -1255,9 +1353,14 @@ function apman.bulk_command(mid, topic, payload)
 	-- A ctrl entry answers later, so the batch is published once the last
 	-- one is in. Every ctrl request carries its own deadline, so a silent
 	-- hostapd delays the batch but cannot lose it.
-	local pending, published = 0, false
+	-- filling guards the case where an entry answers inline instead of later:
+	-- a lookup that fails before the request is sent does exactly that. Without
+	-- it pending would touch zero in the middle of the loop, the batch would be
+	-- published with the commands after it missing, and 'published' would then
+	-- swallow the real result.
+	local pending, published, filling = 0, false, true
 	local function publish_bulk()
-		if published or pending > 0 then
+		if published or filling or pending > 0 then
 			return
 		end
 		published = true
@@ -1277,6 +1380,7 @@ function apman.bulk_command(mid, topic, payload)
 			pending = pending - 1
 		end
 	end
+	filling = false
 	publish_bulk()
 end
 
@@ -1302,6 +1406,7 @@ function apman.publish_agent()
 	feature('ctrl_proxy', apman_ctrl.enabled and have_unix)
 	feature('radius_psk', apman.radius_active)
 	feature('ubus_async', apman.have_ubus_async)
+	feature('ubus_queue', apman.have_ubus_async)
 	feature('mib', apman_ctrl.enabled and have_unix and apman_ctrl.mib_interval > 0)
 	feature('sta_ctrl', apman_ctrl.enabled and have_unix and apman_ctrl.sta_ctrl_interval > 0)
 	feature('ctrl_events', apman_ctrl.events and apman_ctrl.enabled and have_unix)
@@ -1313,6 +1418,13 @@ function apman.publish_agent()
 		started = apman.started_at,
 		features = features,
 		hostapd = { ucode = apman.have_bss_events },
+		-- what the command queue has been doing; a high water mark that keeps
+		-- climbing means commands arrive faster than ubus answers them
+		queue = {
+			depth = apman.ubus_queue_depth(),
+			high = apman.ubus_q_high,
+			limit = apman.ubus_q_max,
+		},
 		intervals = {
 			status = apman.status_interval / 1000,
 			wireless_republish = apman.wireless_republish,
