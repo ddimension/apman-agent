@@ -24,7 +24,7 @@ local have_radius, apman_radius = pcall(require, 'apman-radius')
 have_radius = have_radius and type(apman_radius) == 'table'
 
 local apman = {}
-apman.version = '60-1'			-- set by contrib/release.sh, do not edit
+apman.version = '61-1'			-- set by contrib/release.sh, do not edit
 apman.started_at = nil
 apman.conn = nil
 apman.hostname = nil
