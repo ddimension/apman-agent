@@ -158,6 +158,12 @@ fi
 #
 # Die feste mtime aus der Commit-Zeit ist der Grund, warum derselbe Commit
 # immer denselben Hash ergibt. Wer das nicht glaubt: zweimal laufen lassen.
+#
+# Geprueft, nicht angenommen: dieselben Schritte auf rtl826x-firmware
+# (PKG_SOURCE_DATE 2026-01-24) ergeben exakt den PKG_MIRROR_HASH aus dessen
+# Makefile im Upstream-Baum. Aeltere Tarballs auf sources.openwrt.org stammen
+# noch aus der xz-Zeit und wurden spaeter umgepackt — die taugen nicht als
+# Referenz, ihr Hash ist mit keinem zstd von heute zu treffen.
 # --------------------------------------------------------------------------
 say "mirror-hash berechnen"
 PKG_NAME=apman
@@ -169,15 +175,24 @@ SUBDIR="$PKG_NAME-$NEW_VER"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-git clone -q "$HTTPS_URL" "$TMP/$SUBDIR"
-git -C "$TMP/$SUBDIR" checkout -q "$COMMIT"
-TAR_TIMESTAMP="$(git -C "$TMP/$SUBDIR" log -1 --no-show-signature --format='@%ct')"
-git -C "$TMP/$SUBDIR" config core.abbrev 8
-git -C "$TMP/$SUBDIR" archive --format=tar HEAD --output="$TMP/$SUBDIR.tar.git"
-rm -rf "$TMP/$SUBDIR"; mkdir "$TMP/$SUBDIR"
-tar -C "$TMP/$SUBDIR" -xf "$TMP/$SUBDIR.tar.git"
-( cd "$TMP" && tar --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
-	--mtime="$TAR_TIMESTAMP" -c "$SUBDIR" | zstd -T0 --ultra -20 -q -o "$TMP/$SUBDIR.tar.zst" )
+(
+	# umask 022 um ALLES, und beim Auspacken KEIN -p. Das ist nicht Kosmetik:
+	# `git archive` schreibt die Dateimodi durch die umask (mit 002 werden aus
+	# 644 dann 664), und `tar -x` ohne -p legt sie wieder durch die umask an.
+	# Beides zusammen entscheidet ueber Byte 106 jedes tar-Headers und damit
+	# ueber den Hash. Verifiziert gegen rtl826x-firmware aus dem Upstream-Baum:
+	# mit umask 022 exakt der Hash aus dessen Makefile, mit 002 nicht.
+	umask 022
+	git clone -q "$HTTPS_URL" "$TMP/$SUBDIR"
+	git -C "$TMP/$SUBDIR" checkout -q "$COMMIT"
+	TAR_TIMESTAMP="$(git -C "$TMP/$SUBDIR" log -1 --no-show-signature --format='@%ct')"
+	git -C "$TMP/$SUBDIR" config core.abbrev 8
+	git -C "$TMP/$SUBDIR" archive --format=tar HEAD --output="$TMP/$SUBDIR.tar.git"
+	rm -rf "$TMP/$SUBDIR"; mkdir "$TMP/$SUBDIR"
+	tar -C "$TMP/$SUBDIR" -xf "$TMP/$SUBDIR.tar.git"
+	cd "$TMP" && tar --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
+		--mtime="$TAR_TIMESTAMP" -c "$SUBDIR" | zstd -T0 --ultra -20 -q -o "$TMP/$SUBDIR.tar.zst"
+)
 HASH="$(sha256sum "$TMP/$SUBDIR.tar.zst" | cut -d' ' -f1)"
 echo "tarball: $SUBDIR.tar.zst  ($(stat -c%s "$TMP/$SUBDIR.tar.zst") bytes)"
 echo "sha256:  $HASH"
