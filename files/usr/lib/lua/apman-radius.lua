@@ -384,9 +384,13 @@ function radius.station(pkt)
 	local mac
 	for _, v in ipairs({ user, csid }) do
 		if type(v) == 'string' then
-			local hex = v:gsub('[^%x]', ''):lower()
-			if #hex >= 12 then
-				mac = hex:sub(1, 12)
+			-- a mac is at most 17 characters ('aa:bb:cc:dd:ee:ff'); only the
+			-- hex characters of that window count, so a user name like
+			-- 'anna-00:11:22:33:44:55' cannot shift the address and one with
+			-- a different shape fails closed instead of answering a wrong mac
+			local hex = v:sub(1, 17):gsub('[^%x]', ''):lower()
+			if #hex == 12 then
+				mac = hex
 				break
 			end
 		end
@@ -655,8 +659,10 @@ function radius.load_store(opts)
 		local ks = radius.load_keystore(data)
 		store.source = 'keystore+wireless'
 		store.versions = ks.versions
+		store.ks_ifaces = {}
 		for iface, bucket in pairs(ks.ifaces) do
 			store.ifaces[iface] = bucket
+			store.ks_ifaces[iface] = true
 		end
 		store.errors = store.errors + ks.errors
 		for _, line in ipairs(ks.error_lines) do
@@ -717,20 +723,47 @@ function radius.apply_keys(server, payload)
 	--
 	-- Removing an ssid is the exception. Its interfaces have to fall back to
 	-- whatever the wifi-station sections say, and only the wireless config
-	-- knows that, so it takes the long way.
+	-- knows that, so it takes the long way. The same goes for an interface
+	-- set that changed: the in-place merge below only overwrites buckets, it
+	-- never drops one, and a bucket left behind would keep answering its bss
+	-- with stale keys.
 	local store
 	if payload.keys == nil or payload.keys == cjson.null or server.store == nil
 		or type(server.store.ifaces) ~= 'table' then
 		store = radius.load_store(server.opts)
 	else
-		store = server.store
 		local ks = radius.load_keystore(data)
-		for iface, bucket in pairs(ks.ifaces) do
-			store.ifaces[iface] = bucket
+		local ks_ifaces = {}
+		for iface in pairs(ks.ifaces) do
+			ks_ifaces[iface] = true
 		end
-		store.versions = ks.versions
-		store.source = 'keystore+wireless'
-		store.error_lines = ks.error_lines or {}
+		local changed = server.store.ks_ifaces == nil
+		if not changed then
+			for iface in pairs(server.store.ks_ifaces) do
+				if ks_ifaces[iface] == nil then
+					changed = true
+					break
+				end
+			end
+			for iface in pairs(ks_ifaces) do
+				if server.store.ks_ifaces[iface] == nil then
+					changed = true
+					break
+				end
+			end
+		end
+		if changed then
+			store = radius.load_store(server.opts)
+		else
+			store = server.store
+			for iface, bucket in pairs(ks.ifaces) do
+				store.ifaces[iface] = bucket
+			end
+			store.versions = ks.versions
+			store.source = 'keystore+wireless'
+			store.error_lines = ks.error_lines or {}
+			store.ks_ifaces = ks_ifaces
+		end
 	end
 	server.store = store
 	server.store_digest = nil
@@ -890,9 +923,12 @@ function radius.handle(server, data, ip, port)
 	end
 
 	if entry ~= nil then
-		print(string.format('radius-debug psk=%s from=%s mac=%s bssid=%s ssid=%s akm=%s%s',
-			entry.psk, from, mac or '-', bssid or '-', ssid or '-', tostring(akm),
-			ambiguous and (' AMBIGUOUS(' .. #wildcards .. ')') or ''))
+		-- the key id and origin are logged, the psk itself is not: it is a
+		-- credential, and syslog is forwarded off the device more often than
+		-- anyone remembers
+		print(string.format('radius-debug key=%s from=%s mac=%s bssid=%s ssid=%s akm=%s%s',
+			tostring(entry.name or '?'), from, mac or '-', bssid or '-', ssid or '-',
+			tostring(akm), ambiguous and (' AMBIGUOUS(' .. #wildcards .. ')') or ''))
 	end
 
 	local own_vlan, answered_vlan, vlan_suppressed

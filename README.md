@@ -83,7 +83,7 @@ version, all below `<topic_prefix>ap/<hostname>/`:
 | `hostapd/status` | no | BSS/radio/MLD topology (ucode hostapd only) |
 | `wireless/status` | no | `ubus call network.wireless status` |
 | `command`, `command/bulk` | — | Subscribed; JSON-RPC requests |
-| `command_result`, `command_result/bulk` | yes | JSON-RPC responses |
+| `command_result`, `command_result/bulk` | no / yes | JSON-RPC responses (`command_result` and `command_result/<id>` are not retained, `/bulk` is) |
 
 `<topic_prefix>command` (without the `ap/<hostname>/` part) is a fleet-wide
 broadcast command topic; disable it per device with `command_topic_global '0'`.

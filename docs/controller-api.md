@@ -269,7 +269,7 @@ notification.
 
 ### `notifications/hostapd/<ifname>/<method>`
 Every ubus object whose name starts with `hostapd` is subscribed, so the topic
-segment is the object name with the `hostapd.` prefix stripped
+segment is the object name with the `hostapd.` (or `hostapd-`) prefix stripped
 (`hostapd.wlan0` → `wlan0`, `hostapd-auth` → `auth`, the global `hostapd`
 object → `hostapd`).
 

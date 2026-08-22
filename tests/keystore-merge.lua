@@ -34,7 +34,8 @@ assert(#st.ifaces['radio0_kalclients'].wildcards==1)
 assert(st.errors==1, 'the broken section must be counted, not fatal')
 
 -- now the controller ships a keystore for a DIFFERENT ssid
-local srv={opts=opts, store=st}
+-- the fields radius.reload/note_error expect on a started server
+local srv={opts=opts, store=st, stats={errors=0, reloads=0}, gettime=os.time}
 local res,err=R.apply_keys(srv,{ssid='apmantest', version='v1',
   ifaces={'radio1_apmantest'}, network_key='netzwerkpassphrase',
   keys={{name='ppsk_9_1', mac='aa:bb:cc:dd:ee:02', psk='eigener-key-02'},
@@ -54,9 +55,26 @@ assert(srv.store.ifaces['radio0_kalclients'].entries['aabbccddee01'], 'reload lo
 assert(srv.store.ifaces['radio1_apmantest'].entries['aabbccddee02'], 'reload lost the keystore ssid')
 print('3 reload merged: source='..srv.store.source..' count='..R.store_count(srv.store))
 
+-- moving the ssid to another interface must drop the old bucket: the
+-- in-place merge only overwrites, a bucket left behind would keep
+-- answering its bss with stale keys
+res, err = R.apply_keys(srv, {ssid='apmantest', version='v2',
+  ifaces={'radio1_apmantest2'}, keys={{name='ppsk_9_1', mac='aa:bb:cc:dd:ee:02', psk='eigener-key-02'}}})
+assert(res, tostring(err))
+assert(srv.store.ifaces['radio1_apmantest'] == nil, 'stale bucket survived an iface move')
+assert(srv.store.ifaces['radio1_apmantest2'], 'new iface bucket missing')
+assert(srv.store.ifaces['radio0_kalclients'], 'wireless ssid lost on iface move')
+
+-- a version bump on the same interfaces keeps the in-place merge path
+res, err = R.apply_keys(srv, {ssid='apmantest', version='v3',
+  ifaces={'radio1_apmantest2'}, keys={{name='ppsk_9_1', mac='aa:bb:cc:dd:ee:02', psk='eigener-key-02'}}})
+assert(res, tostring(err))
+assert(srv.store.ifaces['radio1_apmantest2'], 'in-place merge lost the bucket')
+assert(srv.store.ifaces['radio0_kalclients'], 'in-place merge lost the wireless ssid')
+
 -- removing the ssid again
 R.apply_keys(srv,{ssid='apmantest', keys=cjson.null})
-assert(srv.store.ifaces['radio1_apmantest']==nil, 'ssid not removed')
+assert(srv.store.ifaces['radio1_apmantest2']==nil, 'ssid not removed')
 assert(srv.store.ifaces['radio0_kalclients'], 'removal took the other ssid with it')
 print('4 removal ok, count='..R.store_count(srv.store))
 print('KEYSTORE FILE:', io.open('/tmp/t-keys.json'):read('*a'))

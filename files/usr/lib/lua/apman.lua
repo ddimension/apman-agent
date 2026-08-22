@@ -138,6 +138,9 @@ apman.ctrl_event_allow = {
 	['WPS-FAIL'] = true, ['WPS-TIMEOUT'] = true, ['WPS-OVERLAP-DETECTED'] = true,
 	['WPS-ENROLLEE-SEEN'] = true, ['WPS-REG-SUCCESS'] = true, ['WPS-CANCEL'] = true,
 }
+-- the built in allowlists; apply_config rebuilds the live tables from these,
+-- so removing an entry in uci revokes it in the running agent
+apman.ctrl_event_allow_default = apman.ctrl_event_allow
 -- BEACON-RESP-RX is deliberately absent: the ubus beacon-report notification
 -- delivers the same measurement already decoded.
 -- Extra detail pulled from the control channel and folded into the periodic
@@ -195,6 +198,7 @@ apman.ctrl_allowed = {
 	['WPS_PIN'] = true, ['WPS_PBC'] = true, ['WPS_CANCEL'] = true,
 	['REQ_BEACON'] = true, ['REQ_LINK_MEASUREMENT'] = true,
 }
+apman.ctrl_allowed_default = apman.ctrl_allowed
 
 -- ubus status codes, so a consumer gets a reason instead of a bare null
 apman.ubus_status_text = {
@@ -248,6 +252,17 @@ function apman.cfg_list(name, default)
 		return { value }
 	end
 	return default
+end
+
+-- equality key for cfg_list values, so a config change can be told from the
+-- running values
+function apman.list_key(list)
+	local parts = {}
+	for i, value in ipairs(list) do
+		parts[#parts + 1] = tostring(value)
+	end
+	table.sort(parts)
+	return table.concat(parts, '|')
 end
 
 function apman.cfg_bool(name, default)
@@ -381,8 +396,13 @@ function apman.ubusCheckCallback()
 		-- the settle delay has passed, pick up the new object list
 		apman.ubus_resubscribe = nil
 		print('Restarting ubus connection and subscriptions.')
-		apman.reconnect_ubus()
-		apman.subscribeCallback()
+		if apman.reconnect_ubus() then
+			apman.subscribeCallback()
+		else
+			print('ubus reconnect failed, keeping the poll armed.')
+			apman.timers['ubus_check']:set(apman.ubus_check_interval)
+			return
+		end
 	elseif apman.count ~= c2 then
 		print(string.format('Ubus object list changed, waiting %ds before resubscribing.', apman.ubus_settle / 1000))
 		apman.ubus_resubscribe = 1
@@ -508,8 +528,31 @@ function apman.parse_station_dump(text)
 	return stations
 end
 
+-- timer entry: the cycle below runs in a pcall, so a hiccup in one ubus
+-- answer (or a connection that died mid-call) cannot take the whole agent
+-- down, and a cycle that runs longer than the interval is logged instead of
+-- silently pushing the publishes apart. The calls themselves stay
+-- synchronous — the ubus lua binding has no async call — so a slow hostapd
+-- does delay the other uloop work (mqtt, radius, control channel) until the
+-- cycle ends; the log line is how that becomes visible.
 function apman.statusCallback()
-	local topic, devices, data
+	local t0 = socket.gettime()
+	local ok, err = pcall(apman.status_cycle)
+	if not ok then
+		print(string.format('status cycle failed: %s', tostring(err)))
+	end
+	local took = socket.gettime() - t0
+	if took > apman.status_interval / 1000 then
+		print(string.format('status cycle took %.1fs, longer than the %ds interval.',
+			took, apman.status_interval / 1000))
+	end
+	apman.timers['status']:set(apman.status_interval)
+end
+
+-- the synchronous collection itself, unchanged in behaviour; the guard and
+-- the timing log live in the wrapper above
+function apman.status_cycle()
+	local topic, data
 	local devices = apman.conn:call("iwinfo", "devices", {})
 	data = {}
 	data['devices'] = {}
@@ -544,19 +587,27 @@ function apman.statusCallback()
 			iwinfo[value] = info
 			local is_master = 1
 			if info['mode'] ~= nil and info['mode'] == 'Master (VLAN)' then
+				-- vlan slave devices are named <master>.<vid> (e.g. phy0-ap0.7
+				-- under phy0-ap0), so a match needs the dot separator and the
+				-- longest matching master wins: sibling prefixes (ap1 / ap10)
+				-- cannot claim each other's slaves, and the assignment no
+				-- longer depends on the pairs() order of devlist
+				local master = nil
 				for k2, v2 in pairs(devlist) do
-					local s = v2
-					if value ~= s and string.sub(value, 0, string.len(s)) == s then
-						local master = v2
-						is_master = 0
-						if slaves[master] == nil then
-							slaves[master] = {}
+					if value ~= v2 and value:sub(1, #v2 + 1) == v2 .. '.' then
+						if master == nil or #v2 > #master then
+							master = v2
 						end
-						table.insert(slaves[master], value)
-						--print('added slave '..value..' to master '..master)
 					end
 				end
-
+				if master ~= nil then
+					is_master = 0
+					if slaves[master] == nil then
+						slaves[master] = {}
+					end
+					table.insert(slaves[master], value)
+					--print('added slave '..value..' to master '..master)
+				end
 			end
 			if is_master then
 				--print('Add master '..value)
@@ -633,7 +684,6 @@ function apman.statusCallback()
 		data['devices'][value]['sta_ctrl'] = apman.sta_ctrl_values(value)
 
 		topic = apman.ap_topic('device/hostapd/' .. value .. '/status')
-		data['devices']['timestamp'] = socket.gettime()
 		apman.publish_mqtt( topic , cjson.encode(data['devices'][value]))
 		--print("Published data to mqtt topic '"..topic.."'.")
 	end
@@ -666,20 +716,23 @@ function apman.statusCallback()
 		apman.publish_mqtt( topic , cjson.encode(data))
 	end
 
-	apman.timers['status']:set(apman.status_interval)
 end
 
+-- reconnect from the ubus poll timer: a transient ubus failure must not kill
+-- the agent (an error inside a uloop callback ends uloop.run), so the result
+-- is handed back and the caller keeps the poll armed instead. The fatal
+-- variant stays at the explicit call sites (init, collectd) where dying is
+-- the right answer.
 function apman.reconnect_ubus()
-	apman.conn:close()
-	return apman.connect_ubus()
+	if apman.conn ~= nil then
+		apman.conn:close()
+	end
+	apman.connect_ubus()
+	return apman.conn ~= nil
 end
 
 function apman.connect_ubus()
 	apman.conn = ubus.connect()
-	if not apman.conn then
-		error("Failed to connect to ubus")
-		return
-	end
 end
 
 function apman.mqtt_log(level, message)
@@ -735,7 +788,11 @@ function apman.subscribe_ubus()
 	for key, object in pairs(objects) do
 		available[object] = true
 		if apman.starts_with(object, "hostapd") then
-			local topic = apman.ap_topic('notifications/hostapd/' .. object:gsub('%hostapd.',''))
+			-- the topic segment is the object name with the hostapd. (or
+			-- hostapd-) prefix stripped, as documented in
+			-- docs/controller-api.md: hostapd.wlan0 -> wlan0,
+			-- hostapd-auth -> auth, the bare hostapd stays hostapd
+			local topic = apman.ap_topic('notifications/hostapd/' .. object:gsub('^hostapd[%.%-]', ''))
 			print(string.format("Adding subscription for object '%s', assigning to topic '%s'.", object, topic))
 			apman.conn:subscribe(object, apman.createUbusCallback(object, topic))
 			apman.count = apman.count + 1
@@ -760,8 +817,11 @@ function apman.subscribe_ubus()
 	-- hostapd-auth announces every applied wifi config (config_set ->
 	-- reload). The radius keys come from the wifi-station sections of that
 	-- config, so re-read them on the spot instead of waiting for the digest
-	-- timer; the other notifications it sends (sta_auth, sta_connected) are
-	-- not ours to forward here.
+	-- timer. This is a second subscription to the same object, on top of the
+	-- generic one above: the binding registers a separate subscriber per call
+	-- (ubus.c: ubus_register_subscriber), so both callbacks fire — the
+	-- generic one keeps forwarding sta_auth/sta_connected under
+	-- notifications/hostapd/auth/, this one only acts on reload.
 	if available['hostapd-auth'] and apman.radius_active then
 		local ok, err = pcall(function()
 			apman.conn:subscribe('hostapd-auth', {
@@ -850,14 +910,9 @@ function apman.get_rpc_session_ubus()
 	if type(session) ~= 'table' or session['ubus_rpc_session'] == nil then
 		-- the caller drops a nil answer; indexing a half answer must not
 		-- take the agent down at boot
-		print(string.format("Result of session create: %s", cjson.encode(session)))
+		print("Result of session create: not usable")
 		return nil
 	end
-	print(string.format("Result of session create: %s", cjson.encode(session)))
-
-	local result
-	result = apman.conn:call("session", "list", { ubus_rpc_session = session['ubus_rpc_session'] })
-	print(string.format("Result of session list: %s", cjson.encode(result)))
 
 	-- rpcd expects each entry as an array [object, function] and silently
 	-- skips anything else, so a map here granted nothing at all
@@ -865,9 +920,10 @@ function apman.get_rpc_session_ubus()
 	table.insert(opts['objects'], {'/*', 'read'})
 	table.insert(opts['objects'], {'/*', 'write'})
 	table.insert(opts['objects'], {'/*', 'exec'})
-	print(string.format("Opts for session grant: %s", cjson.encode(opts)))
-	result = apman.conn:call("session", "grant", opts)
-	print(string.format("Result of session gant: %s", cjson.encode(result)))
+	local result, status = apman.conn:call("session", "grant", opts)
+	if status ~= nil and status ~= 0 then
+		print(string.format("Result of session grant (file scope): failed (%s)", tostring(status)))
+	end
 
 	-- rpcd checks uci access in its own scope, not in 'file'. Without this the
 	-- session can read and write files but every uci call comes back as
@@ -876,12 +932,16 @@ function apman.get_rpc_session_ubus()
 	opts = { scope = 'uci', objects = {}, ubus_rpc_session = session['ubus_rpc_session']}
 	table.insert(opts['objects'], {'*', 'read'})
 	table.insert(opts['objects'], {'*', 'write'})
-	result = apman.conn:call("session", "grant", opts)
-	print(string.format("Result of uci scope grant: %s", cjson.encode(result)))
+	result, status = apman.conn:call("session", "grant", opts)
+	if status ~= nil and status ~= 0 then
+		print(string.format("Result of session grant (uci scope): failed (%s)", tostring(status)))
+	end
 
-	result = apman.conn:call("session", "list", { ubus_rpc_session = session['ubus_rpc_session'] })
-	print(string.format("Result of session list: %s", cjson.encode(result)))
-
+	-- The session id itself is a root-equivalent bearer token — the grants
+	-- above are full file and uci access — and is deliberately not logged:
+	-- syslog is forwarded off the device in most deployments. It is
+	-- published on properties/session/create, which is the documented
+	-- handover to the controller; the broker is the security boundary.
 	apman.session = session
 	return session
 end
@@ -912,38 +972,34 @@ function apman.setup_mqtt()
 		end
 		apman.client:login_set(apman.config['mqtt_username'], mqtt_password)
 	end
-	if true then
-		local cafile, capath, certfile, keyfile
-		if apman.config['cafile'] then
-			cafile = apman.config['cafile']
-		end
-		if apman.config['capath'] then
-			capath = apman.config['capath']
-		end
-		if apman.config['certfile'] then
-			certfile = apman.config['certfile']
-		end
-		if apman.config['keyfile'] then
-			keyfile = apman.config['keyfile']
-		end
-		if cafile or capath or certfile or keyfile then
-			apman.client:tls_set(cafile, capath, certfile, keyfile)
-		end
+	local cafile, capath, certfile, keyfile
+	if apman.config['cafile'] then
+		cafile = apman.config['cafile']
 	end
-	if true then
-		local cert, tls_version, ciphers
-		if apman.config['cert'] then
-			cert = apman.config['cert']
-		end
-		if apman.config['tls_version'] then
-			tls_version = apman.config['tls_version']
-		end
-		if apman.config['ciphers'] then
-			ciphers = apman.config['ciphers']
-		end
-		if cert and (tls_version or ciphers) then
-			apman.client:tls_opts_set(cert, tls_version, ciphers)
-		end
+	if apman.config['capath'] then
+		capath = apman.config['capath']
+	end
+	if apman.config['certfile'] then
+		certfile = apman.config['certfile']
+	end
+	if apman.config['keyfile'] then
+		keyfile = apman.config['keyfile']
+	end
+	if cafile or capath or certfile or keyfile then
+		apman.client:tls_set(cafile, capath, certfile, keyfile)
+	end
+	local cert, tls_version, ciphers
+	if apman.config['cert'] then
+		cert = apman.config['cert']
+	end
+	if apman.config['tls_version'] then
+		tls_version = apman.config['tls_version']
+	end
+	if apman.config['ciphers'] then
+		ciphers = apman.config['ciphers']
+	end
+	if cert and (tls_version or ciphers) then
+		apman.client:tls_opts_set(cert, tls_version, ciphers)
 	end
 
 	if type(apman.config['tls_insecure']) == 'string' then
@@ -1198,7 +1254,7 @@ end
 -- optional station address and free "key=value" fields.
 function apman.ctrl_event_parse(msg)
 	local line = string.gsub(msg, '\n+$', '')
-	local priority, rest = string.match(line, '^<(%d)>(.*)$')
+	local priority, rest = string.match(line, '^<(%d+)>(.*)$')
 	if rest == nil then
 		priority, rest = nil, line
 	end
@@ -2007,10 +2063,10 @@ function apman.getCollectdStats()
 	if not apman.hostname then
 		print("Resolving Hostname")
 		result = apman.conn:call("uci", "get", {["config"] = "system",["section"] = "main",["option"] = "hostname"})
-		if result == nil or result.value == nil then
+		if type(result) ~= 'table' or result.value == nil then
 			result = apman.conn:call("uci", "get", {["config"] = "system",["section"] = "@system[0]",["option"] = "hostname"})
 		end
-		if result.value == nil then
+		if type(result) ~= 'table' or result.value == nil then
 			print("Failed to get hostname")
 			apman.conn:close()
 			return 1
@@ -2022,15 +2078,24 @@ function apman.getCollectdStats()
         local network_wireless_status = apman.conn:call("network.wireless", "status", {})
 	local dev2radio = {}
 	local radio_stats = {}
+	if type(network_wireless_status) ~= 'table' then
+		print("collectd: network.wireless status not available, skipping this read")
+		apman.conn:close()
+		return 1
+	end
         for radio, value in pairs(network_wireless_status) do
-		radio_stats[ radio ] = {}
-		radio_stats[ radio ][ 'stations' ] = 0
-		radio_stats[ radio ][ 'up' ] = value['up']
+		if type(value) ~= 'table' then
+			radio_stats[ radio ] = { stations = 0 }
+		else
+			radio_stats[ radio ] = {}
+			radio_stats[ radio ][ 'stations' ] = 0
+			radio_stats[ radio ][ 'up' ] = value['up']
 
-		if type(value['interfaces']) == 'table' then
-			for interface, ifconfig in pairs(value['interfaces']) do
-				if ifconfig['ifname'] ~= nil then
-					dev2radio[ ifconfig['ifname'] ] = radio
+			if type(value['interfaces']) == 'table' then
+				for interface, ifconfig in pairs(value['interfaces']) do
+					if type(ifconfig) == 'table' and ifconfig['ifname'] ~= nil then
+						dev2radio[ ifconfig['ifname'] ] = radio
+					end
 				end
 			end
 		end
@@ -2039,6 +2104,11 @@ function apman.getCollectdStats()
         local devices = apman.conn:call("iwinfo", "devices", {})
         local slaves = {}
         local masters = {}
+	if type(devices) ~= 'table' or type(devices['devices']) ~= 'table' then
+		print("collectd: iwinfo device list not available, skipping this read")
+		apman.conn:close()
+		return 1
+	end
         for key, value in pairs(devices['devices']) do
                 local i,j, masterdev
 		masterdev = value
@@ -2057,7 +2127,7 @@ function apman.getCollectdStats()
 			local radio = dev2radio[masterdev]
 			status = apman.conn:call("network.device", "status", {name = value})
 			if type(status) == 'table' and type(status['statistics']) == 'table' then
-				if type(radio_stats[radio]['statistics']) == 'nil' then
+				if radio_stats[radio]['statistics'] == nil then
 					radio_stats[radio]['statistics'] = status['statistics']
 				else
 					for k2, v2 in pairs(status['statistics']) do
@@ -2078,7 +2148,9 @@ function apman.getCollectdStats()
 		radio = dev2radio[ value ]
 		if type(status) == 'table' then
 			if status['airtime'] and type(status['airtime']) == 'table' then
-				if status['airtime']['utilization'] ~= nil then
+				if status['airtime']['time'] ~= nil
+						and status['airtime']['time_busy'] ~= nil
+						and status['airtime']['utilization'] ~= nil then
 					local t = {
 						host = apman.hostname,
 						plugin = apman.collects_stats_plugin_name,
@@ -2095,7 +2167,9 @@ function apman.getCollectdStats()
 			end
 
 			if status['dfs'] and type(status['dfs']) == 'table' then
-				if type(status['dfs']['cac_seconds']) ~= nil then
+				if status['dfs']['cac_seconds'] ~= nil
+						and status['dfs']['cac_seconds_left'] ~= nil
+						and status['dfs']['cac_active'] ~= nil then
 					local t = {
 						host = apman.hostname,
 						plugin = apman.collects_stats_plugin_name,
@@ -2130,13 +2204,10 @@ function apman.getCollectdStats()
 		end
 
                 clients = apman.conn:call("hostapd."..value, "get_clients", {})
-		if type(clients) == 'table' then
-			if type(clients['clients']) == 'table' then
-				for a3, b3 in pairs(clients['clients']) do
-					radio_stats[radio]['stations'] = radio_stats[radio]['stations'] + 1
-				end
+		if radio ~= nil and type(clients) == 'table' and type(clients['clients']) == 'table' then
+			for a3, b3 in pairs(clients['clients']) do
+				radio_stats[radio]['stations'] = radio_stats[radio]['stations'] + 1
 			end
-
 		end
         end
 
@@ -2182,41 +2253,55 @@ function apman.getCollectdStats()
 			collectd.dispatch_values(t)
 		end
 		if stats['statistics'] ~= nil then
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'if_octets',
-				values = {stats['statistics']['rx_bytes']%1073741824, stats['statistics']['tx_bytes']%1073741824}
-			}
-			collectd.dispatch_values(t)
+			-- every counter pair is dispatched on its own: a key netifd does
+			-- not report must not take the whole read down with it
+			local rx, tx = stats['statistics']['rx_bytes'], stats['statistics']['tx_bytes']
+			if rx ~= nil and tx ~= nil then
+				local t = {
+					host = apman.hostname,
+					plugin = apman.collects_stats_plugin_name,
+					plugin_instance = radio,
+					type = 'if_octets',
+					values = {rx % 1073741824, tx % 1073741824}
+				}
+				collectd.dispatch_values(t)
+			end
 
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'if_packets',
-				values = {stats['statistics']['rx_packets'], stats['statistics']['tx_packets']}
-			}
-			collectd.dispatch_values(t)
+			rx, tx = stats['statistics']['rx_packets'], stats['statistics']['tx_packets']
+			if rx ~= nil and tx ~= nil then
+				local t = {
+					host = apman.hostname,
+					plugin = apman.collects_stats_plugin_name,
+					plugin_instance = radio,
+					type = 'if_packets',
+					values = {rx, tx}
+				}
+				collectd.dispatch_values(t)
+			end
 
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'if_dropped',
-				values = {stats['statistics']['rx_dropped'], stats['statistics']['tx_dropped']}
-			}
-			collectd.dispatch_values(t)
+			rx, tx = stats['statistics']['rx_dropped'], stats['statistics']['tx_dropped']
+			if rx ~= nil and tx ~= nil then
+				local t = {
+					host = apman.hostname,
+					plugin = apman.collects_stats_plugin_name,
+					plugin_instance = radio,
+					type = 'if_dropped',
+					values = {rx, tx}
+				}
+				collectd.dispatch_values(t)
+			end
 
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'if_errors',
-				values = {stats['statistics']['rx_errors'], stats['statistics']['tx_errors']}
-			}
-			collectd.dispatch_values(t)
+			rx, tx = stats['statistics']['rx_errors'], stats['statistics']['tx_errors']
+			if rx ~= nil and tx ~= nil then
+				local t = {
+					host = apman.hostname,
+					plugin = apman.collects_stats_plugin_name,
+					plugin_instance = radio,
+					type = 'if_errors',
+					values = {rx, tx}
+				}
+				collectd.dispatch_values(t)
+			end
 		end
 	end
 
@@ -2233,7 +2318,7 @@ function apman.init()
 
 	-- config
 	result = apman.conn:call("uci", "get", {["config"] = "system",["section"] = "@system[0]",["option"] = "hostname"})
-	if result.value == nil then
+	if type(result) ~= 'table' or result.value == nil then
 		print("Failed to get hostname")
 		os.exit(1)
 	end
@@ -2398,8 +2483,18 @@ function apman.apply_config()
 	apman.station_dump = apman.cfg_bool('station_dump', true)
 	apman.command_topic_global = apman.cfg_bool('command_topic_global', true)
 	apman.hostapd_status = apman.cfg_bool('hostapd_status', true)
+	local old_subscribe = apman.subscribe_objects
+	local old_events = apman.listen_events
 	apman.subscribe_objects = apman.cfg_list('subscribe', apman.subscribe_objects)
 	apman.listen_events = apman.cfg_list('listen_event', apman.listen_events)
+	-- the ubus subscriptions live until the next resubscribe; a config change
+	-- that alters them needs one now. At init the timer does not exist yet,
+	-- the first subscribe picks the new values up anyway.
+	if apman.timers['ubus_check'] ~= nil and
+			(apman.list_key(apman.subscribe_objects) ~= apman.list_key(old_subscribe)
+			 or apman.list_key(apman.listen_events) ~= apman.list_key(old_events)) then
+		apman.schedule_resubscribe('config change')
+	end
 	apman.property_republish = apman.cfg_num('property_republish', 300)
 	apman.wireless_republish = apman.cfg_num('wireless_republish', 60)
 	apman.probe_interval = apman.cfg_num('probe_interval', 10)
@@ -2444,11 +2539,21 @@ function apman.apply_config()
 	apman.ctrl_dir = apman.cfg('ctrl_dir', apman.ctrl_dir)
 	apman.ctrl_events = apman.cfg_bool('ctrl_events', true)
 	apman.ctrl_event_all = apman.cfg_bool('ctrl_event_all', false)
+	-- rebuilt from the built in defaults every time: a verb or event that
+	-- was added by a previous config must not survive its removal in uci
+	apman.ctrl_event_allow = {}
+	for event in pairs(apman.ctrl_event_allow_default) do
+		apman.ctrl_event_allow[event] = true
+	end
 	for _, name in ipairs(apman.cfg_list('ctrl_event_allow', {})) do
 		apman.ctrl_event_allow[string.upper(name)] = true
 	end
 	for _, name in ipairs(apman.cfg_list('ctrl_event_deny', {})) do
 		apman.ctrl_event_allow[string.upper(name)] = nil
+	end
+	apman.ctrl_allowed = {}
+	for verb in pairs(apman.ctrl_allowed_default) do
+		apman.ctrl_allowed[verb] = true
 	end
 	for _, verb in ipairs(apman.cfg_list('ctrl_allow', {})) do
 		apman.ctrl_allowed[string.upper(verb)] = true
