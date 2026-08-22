@@ -105,6 +105,47 @@ of guessing from firmware versions:
 Absence of this topic means an agent older than 56-2: no `command_v2`, no
 `survey`, no `bss_info`, and probe requests are unthrottled.
 
+### `properties/radius` — retained, QoS 1
+
+The state of the on-AP RADIUS server, published every status tick and whenever
+the key store changes. Present even when the server is off, because "not
+running, and here is why" is the answer that matters most and an absent topic
+cannot carry it.
+
+```json
+{"running":true,"bind":"127.0.0.1","port":1812,"started":1787371644.43,
+ "reload_interval":10,
+ "store":{"source":"keystore+wireless","keys":100,
+          "ssids":{"kalclients":"43f7cf783b91","kalnet":"41e7d0726159"},
+          "reloads":3,"last_reload":1787372010.1},
+ "stats":{"accepted":41,"rejected":2,"dropped":0,"errors":0,
+          "requests":43,"avg_ms":1.34,"max_ms":4.35},
+ "last":{"ts":1787372110.2,"mac":"aa:bb:cc:dd:ee:ff","ssid":"kalnet",
+         "decision":"accept","key":"ppsk_87_480","key_source":"per-mac","ms":1.2},
+ "last_error":{"ts":1787371700.0,"message":"…"},
+ "hostname":"ap-av-attic","ts":1787372110.5}
+```
+
+When it is not running, `running` is `false` and `reason` says why — a missing
+secret, a failed bind, or simply not enabled in `/etc/config/apman`. The last
+error is kept after a recovery on purpose: a store reload that fixes a bad key
+section leaves no other trace, and an error that scrolled out of a log on an
+access point never happened as far as anyone looking later is concerned.
+
+**What `avg_ms`, `max_ms` and the `ms` on `radius/auth` do not measure.** The
+clock starts when the agent takes the packet out of the socket, not when the
+packet arrived. If the agent is busy — a blocking ubus call, a long status
+cycle — the request waits in the kernel's receive buffer and none of that
+waiting is counted. Measured across a change that removed 680 ms of blocking
+per ten seconds, these numbers moved from 0.59 ms to 0.64 ms average: they are
+blind to it by construction.
+
+So they answer "how long does the server take to decide", which is worth
+knowing, and they do **not** answer "how quickly did a station get in". For the
+second, measure a ubus round trip from outside the access point and look at the
+tail — p90, p99, and the share above 300 ms, which is roughly where a station
+gives up after three tries on the authentication frame.
+
 ### `survey/<ifname>`
 `ubus call iwinfo survey`, published every `survey_interval` seconds (default
 300, `0` disables). Per channel: `mhz`, `noise`, `active_time`, `busy_time`,
