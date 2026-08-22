@@ -354,7 +354,30 @@ function apman.collect_station_dumps(devlist)
 		return dumps
 	end
 
-	local output = apman.getOutput(table.concat(cmd, "; "))
+	return apman.split_station_dumps(dumps, apman.getOutput(table.concat(cmd, "; ")))
+end
+
+-- the same, collected through uloop so the fork does not stop the agent
+function apman.collect_station_dumps_async(devlist, cb)
+	local dumps = {}
+	local cmd = {}
+
+	for key, device in pairs(devlist) do
+		dumps[device] = {}
+		table.insert(cmd, "iw dev " .. device .. " station dump")
+	end
+	if #cmd == 0 then
+		cb(dumps)
+
+		return
+	end
+	apman.run_capture('dumps', table.concat(cmd, "; "), function(output)
+		cb(apman.split_station_dumps(dumps, output))
+	end)
+end
+
+-- the parsing half, so the same code serves the blocking and the uloop path
+function apman.split_station_dumps(dumps, output)
 	local pos, len, current = 1, #output, nil
 	while pos <= len do
 		local line
@@ -429,6 +452,45 @@ end
 -- consumed there today. What the text cannot give as faithfully is the
 -- encryption object, which becomes the string iwinfo prints; nothing consumes
 -- it structurally.
+-- Run a command without stopping the process.
+--
+-- io.popen blocks until the child is done — 105 ms for iwinfo on an access
+-- point with eleven interfaces, 38 ms for the station dumps — and during that
+-- the uloop does not turn: no mqtt, no control channel, no RADIUS answers.
+-- Neither a queue nor call_async reaches this, because it is not ubus.
+--
+-- uloop.process forks and calls back on exit, so the loop keeps running.
+-- Proven on hardware: 23 timer ticks arrived during one 96 ms iwinfo run.
+-- It gives no pipe, so the output goes to a file and is read in the callback;
+-- the file is in /tmp, which is a tmpfs, so this costs no flash.
+--
+-- Falls back to the blocking read when uloop has no process support, which
+-- keeps this working on a binding that does not have it.
+function apman.run_capture(name, command, cb)
+	if type(uloop.process) ~= 'function' then
+		cb(apman.getOutput(command))
+
+		return
+	end
+	local path = '/tmp/.apman-' .. name
+	local ok = pcall(function()
+		-- braces around the command: without them a list joined with ';'
+		-- redirects only its last member, and the output of everything
+		-- before it is lost. The station dumps are exactly such a list, and
+		-- the file came out empty because the last interface had no stations.
+		uloop.process('/bin/sh', { '-c', '{ ' .. command .. ' ; } > ' .. path .. ' 2>/dev/null' }, {},
+			function(code)
+				local f = io.open(path)
+				local out = f and f:read('*a') or ''
+				if f then f:close() end
+				cb(out)
+			end)
+	end)
+	if not ok then
+		cb(apman.getOutput(command))
+	end
+end
+
 function apman.parse_iwinfo(text)
 	local out = {}
 	local cur = nil
@@ -526,8 +588,11 @@ function apman.status_cycle()
 		devlist = devices['devices']
 	end
 
-	-- one iwinfo run for all of them, see apman.parse_iwinfo
-	local iwall = apman.parse_iwinfo(apman.getOutput('iwinfo 2>/dev/null'))
+	-- one iwinfo run for all of them, see apman.parse_iwinfo — and it runs
+	-- through uloop, so the 105 ms it takes are 105 ms in which this agent
+	-- still answers
+	apman.run_capture('iwinfo', 'iwinfo', function(iwtext)
+	local iwall = apman.parse_iwinfo(iwtext)
 
 	for key, value in pairs(devlist) do
 		local info = iwall[value]
@@ -575,7 +640,7 @@ function apman.status_cycle()
 	--
 	-- Everything after this waits for the last of them, in finish() below.
 	local pending, listed = 0, false
-	local finish
+	local finish, publish_all
 	local function landed()
 		pending = pending - 1
 		if listed and pending == 0 then
@@ -626,11 +691,15 @@ function apman.status_cycle()
 	end
 
 	function finish()
-	local dumps = {}
-	if apman.station_dump then
-		dumps = apman.collect_station_dumps(dumpdevs)
+	-- the station dumps are a fork, not a ubus call, so they get the same
+	-- treatment: run through uloop and continue when the output is there
+	if not apman.station_dump then
+		return publish_all({})
+	end
+	apman.collect_station_dumps_async(dumpdevs, publish_all)
 	end
 
+	function publish_all(dumps)
 	apman.publish_survey(masters)
 
 	for key, value in pairs(masters) do
@@ -720,6 +789,7 @@ function apman.status_cycle()
 	if pending == 0 then
 		finish()
 	end
+	end)
 end
 
 -- reconnect from the ubus poll timer: a transient ubus failure must not kill
