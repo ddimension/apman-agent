@@ -483,6 +483,23 @@ looks special:
 Status 7 is `timeout` and status 4 is `not found`, so the two are told apart by
 the code, not by the shape.
 
+**One ambiguity the code alone cannot resolve**, and a field that does. Status 4
+means two different things: hostapd answered "I do not have that station", or
+the ubus object `hostapd.<ifname>` does not exist at all because the bss is not
+running. A command fanned out over several bsses reads the first as "not on
+this one" — a reasonable conclusion, and the wrong one for the second, where it
+hides a bss that is down. When the request never reached ubus, the error
+carries `"stage": "lookup"`:
+
+```json
+{"error":{"code":4,"message":"not found","object":"hostapd.wap-kc9",
+          "method":"del_client","stage":"lookup"}}
+```
+
+Absent `stage` means the object itself answered. The field is set on the
+deferred path only — the synchronous binding reports both cases identically and
+there is nothing to read it from.
+
 The deadline is the connection's ubus timeout, 30 s, unless the command carries
 its own:
 

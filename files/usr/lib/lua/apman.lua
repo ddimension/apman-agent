@@ -602,8 +602,13 @@ function apman.ubus_call(object, method, args, cb, timeout)
 		if ok then
 			return true
 		end
-		-- the lookup or the invoke itself failed; there will be no callback
-		cb(nil, status or 6)
+		-- The request never left the agent: the object does not exist, or the
+		-- invoke was refused. Worth telling apart, because a missing object
+		-- and a hostapd that answers "not found" are both ubus status 4, and
+		-- a caller fanning a command out over several bsses reads the second
+		-- as "the station is not on this one" — which for the first is a
+		-- wrong conclusion that hides a bss that is not running at all.
+		cb(nil, status or 6, 'lookup')
 
 		return false
 	end
@@ -1103,13 +1108,16 @@ function apman.execute_rpc(cmd, done)
 		print(string.format("calling (async%s) %s %s with %s",
 			timeout and (' ' .. timeout .. 's') or '', object, method,
 			apman.trunc(cjson.encode(args))))
-		apman.ubus_call(object, method, args, function(result, status)
+		apman.ubus_call(object, method, args, function(result, status, stage)
 			if result == nil and type(status) == 'number' and status ~= 0 then
 				response['error'] = {
 					code = status,
 					message = apman.ubus_status_text[status] or 'ubus error',
 					object = object,
 					method = method,
+					-- only set when the call never reached ubus; absent means
+					-- this is what the object itself answered
+					stage = stage,
 				}
 				print(string.format("call (async) %s %s failed: %s (%d)",
 					object, method, response['error'].message, status))
