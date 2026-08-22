@@ -39,175 +39,32 @@
 local radius = {}
 
 -------------------------------------------------------------- md5 (RFC 1321)
--- Pure Lua, arithmetic only: the device has no crypto module and none is
--- wanted as a dependency. Bitwise ops come from 16x16 nibble tables, built
--- once. All values are kept as exact integers below 2^32.
+-- From the lua-md5 package, which this one depends on.
+--
+-- There was a pure Lua implementation here, arithmetic only, because the
+-- device had no crypto module and none was wanted as a dependency. It was
+-- correct and it cost 9 ms per hash on an ipq60xx: this lua has no bit
+-- library, so every and/or/xor went through 16x16 nibble tables. One
+-- Access-Accept needs three to five hashes, which was the 40-60 ms round trip
+-- hostapd reported — and with macaddr_acl=2 the access point stays silent
+-- until the answer is in, while the station gives up on the authentication
+-- frame after three tries in ~330 ms. Those milliseconds decide whether a roam
+-- is a fast transition or a full reauthentication. lua-md5 does the same hash
+-- in 4 us, so what was left of the fallback was a slow way to fail.
 
-local and_tab, or_tab, xor_tab = {}, {}, {}
-do
-	for a = 0, 15 do
-		for b = 0, 15 do
-			local aa, bb, andv, orv, xorv, bit = a, b, 0, 0, 0, 1
-			for _ = 1, 4 do
-				local abit, bbit = aa % 2, bb % 2
-				if abit + bbit == 2 then andv = andv + bit end
-				if abit + bbit >= 1 then orv = orv + bit end
-				if abit ~= bbit then xorv = xorv + bit end
-				aa, bb = (aa - abit) / 2, (bb - bbit) / 2
-				bit = bit * 2
-			end
-			and_tab[a * 16 + b] = andv
-			or_tab[a * 16 + b] = orv
-			xor_tab[a * 16 + b] = xorv
-		end
-	end
-end
-
-local function nibop(tab, a, b)
-	local r, f = 0, 1
-	for _ = 1, 8 do
-		r = r + tab[(a % 16) * 16 + (b % 16)] * f
-		a, b = math.floor(a / 16), math.floor(b / 16)
-		f = f * 16
-	end
-	return r
-end
-
-local function band(a, b) return nibop(and_tab, a, b) end
-local function bor(a, b) return nibop(or_tab, a, b) end
-local function bxor(a, b) return nibop(xor_tab, a, b) end
-local function bnot(a) return 4294967295 - a end
-
--- shifts stay exact: the factor is moved behind a mod so no intermediate
--- exceeds 2^53, and division by a power of two only moves the exponent
-local function lshift(a, n)
-	local m = 2 ^ (32 - n)
-	return (a % m) * (2 ^ n)
-end
-local function rshift(a, n)
-	return math.floor(a / (2 ^ n))
-end
-local function rol(a, n)
-	return (lshift(a, n) + rshift(a, 32 - n)) % 4294967296
-end
-
-local K = {
-	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
-	0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-	0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-	0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-	0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-	0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-	0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-	0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
-	0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-	0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-	0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-	0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
-	0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-	0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-	0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-}
-
-local function md5(message)
-	local len = #message
-
-	-- padding: 0x80, zeros to 56 mod 64, then the bit length little endian
-	local rem = (len + 1) % 64
-	local zero = (rem <= 56) and (56 - rem) or (120 - rem)
-	local bitlen = len * 8
-	local low = bitlen % 4294967296
-	local high = math.floor(bitlen / 4294967296)
-	message = message .. string.char(0x80) .. string.rep('\0', zero) ..
-		string.char(low % 256, math.floor(low / 256) % 256,
-			math.floor(low / 65536) % 256, math.floor(low / 16777216),
-			high % 256, math.floor(high / 256) % 256,
-			math.floor(high / 65536) % 256, math.floor(high / 16777216))
-
-	local a, b, c, d = 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
-
-	local function F(x, y, z) return bor(band(x, y), band(bnot(x), z)) end
-	local function G(x, y, z) return bor(band(x, z), band(y, bnot(z))) end
-	local function H(x, y, z) return bxor(bxor(x, y), z) end
-	local function I(x, y, z) return bxor(y, bor(x, bnot(z))) end
-	local function FF(v, x, y, z, m, s, ac)
-		return (rol((v + F(x, y, z) + m + ac) % 4294967296, s) + x) % 4294967296
-	end
-	local function GG(v, x, y, z, m, s, ac)
-		return (rol((v + G(x, y, z) + m + ac) % 4294967296, s) + x) % 4294967296
-	end
-	local function HH(v, x, y, z, m, s, ac)
-		return (rol((v + H(x, y, z) + m + ac) % 4294967296, s) + x) % 4294967296
-	end
-	local function II(v, x, y, z, m, s, ac)
-		return (rol((v + I(x, y, z) + m + ac) % 4294967296, s) + x) % 4294967296
-	end
-
-	local m = {}
-	for pos = 1, #message, 64 do
-		for i = 0, 15 do
-			local off = pos + i * 4
-			m[i + 1] = message:byte(off) + message:byte(off + 1) * 256 +
-				message:byte(off + 2) * 65536 + message:byte(off + 3) * 16777216
-		end
-
-		local a0, b0, c0, d0 = a, b, c, d
-
-		-- round 1
-		a = FF(a, b, c, d, m[1], 7, K[1]); d = FF(d, a, b, c, m[2], 12, K[2])
-		c = FF(c, d, a, b, m[3], 17, K[3]); b = FF(b, c, d, a, m[4], 22, K[4])
-		a = FF(a, b, c, d, m[5], 7, K[5]); d = FF(d, a, b, c, m[6], 12, K[6])
-		c = FF(c, d, a, b, m[7], 17, K[7]); b = FF(b, c, d, a, m[8], 22, K[8])
-		a = FF(a, b, c, d, m[9], 7, K[9]); d = FF(d, a, b, c, m[10], 12, K[10])
-		c = FF(c, d, a, b, m[11], 17, K[11]); b = FF(b, c, d, a, m[12], 22, K[12])
-		a = FF(a, b, c, d, m[13], 7, K[13]); d = FF(d, a, b, c, m[14], 12, K[14])
-		c = FF(c, d, a, b, m[15], 17, K[15]); b = FF(b, c, d, a, m[16], 22, K[16])
-		-- round 2
-		a = GG(a, b, c, d, m[2], 5, K[17]); d = GG(d, a, b, c, m[7], 9, K[18])
-		c = GG(c, d, a, b, m[12], 14, K[19]); b = GG(b, c, d, a, m[1], 20, K[20])
-		a = GG(a, b, c, d, m[6], 5, K[21]); d = GG(d, a, b, c, m[11], 9, K[22])
-		c = GG(c, d, a, b, m[16], 14, K[23]); b = GG(b, c, d, a, m[5], 20, K[24])
-		a = GG(a, b, c, d, m[10], 5, K[25]); d = GG(d, a, b, c, m[15], 9, K[26])
-		c = GG(c, d, a, b, m[4], 14, K[27]); b = GG(b, c, d, a, m[9], 20, K[28])
-		a = GG(a, b, c, d, m[14], 5, K[29]); d = GG(d, a, b, c, m[3], 9, K[30])
-		c = GG(c, d, a, b, m[8], 14, K[31]); b = GG(b, c, d, a, m[13], 20, K[32])
-		-- round 3
-		a = HH(a, b, c, d, m[6], 4, K[33]); d = HH(d, a, b, c, m[9], 11, K[34])
-		c = HH(c, d, a, b, m[12], 16, K[35]); b = HH(b, c, d, a, m[15], 23, K[36])
-		a = HH(a, b, c, d, m[2], 4, K[37]); d = HH(d, a, b, c, m[5], 11, K[38])
-		c = HH(c, d, a, b, m[8], 16, K[39]); b = HH(b, c, d, a, m[11], 23, K[40])
-		a = HH(a, b, c, d, m[14], 4, K[41]); d = HH(d, a, b, c, m[1], 11, K[42])
-		c = HH(c, d, a, b, m[4], 16, K[43]); b = HH(b, c, d, a, m[7], 23, K[44])
-		a = HH(a, b, c, d, m[10], 4, K[45]); d = HH(d, a, b, c, m[13], 11, K[46])
-		c = HH(c, d, a, b, m[16], 16, K[47]); b = HH(b, c, d, a, m[3], 23, K[48])
-		-- round 4
-		a = II(a, b, c, d, m[1], 6, K[49]); d = II(d, a, b, c, m[8], 10, K[50])
-		c = II(c, d, a, b, m[15], 15, K[51]); b = II(b, c, d, a, m[6], 21, K[52])
-		a = II(a, b, c, d, m[13], 6, K[53]); d = II(d, a, b, c, m[4], 10, K[54])
-		c = II(c, d, a, b, m[11], 15, K[55]); b = II(b, c, d, a, m[2], 21, K[56])
-		a = II(a, b, c, d, m[9], 6, K[57]); d = II(d, a, b, c, m[16], 10, K[58])
-		c = II(c, d, a, b, m[7], 15, K[59]); b = II(b, c, d, a, m[14], 21, K[60])
-		a = II(a, b, c, d, m[5], 6, K[61]); d = II(d, a, b, c, m[12], 10, K[62])
-		c = II(c, d, a, b, m[3], 15, K[63]); b = II(b, c, d, a, m[10], 21, K[64])
-
-		a = (a + a0) % 4294967296
-		b = (b + b0) % 4294967296
-		c = (c + c0) % 4294967296
-		d = (d + d0) % 4294967296
-	end
-
-	local function le32(x)
-		return string.char(x % 256, math.floor(x / 256) % 256,
-			math.floor(x / 65536) % 256, math.floor(x / 16777216))
-	end
-	return le32(a) .. le32(b) .. le32(c) .. le32(d)
-end
+local native = require('md5')
+local md5 = native.sum
+radius.native_md5 = true
 
 local function xor_str(x, y)
+	if #x == #y then
+		return native.exor(x, y)
+	end
+	-- md5.exor insists on equal lengths. Nothing calls this with a short
+	-- tail today; hmac below needs it to keep working if anything ever does.
 	local out = {}
 	for i = 1, #x do
-		out[i] = string.char(bxor(x:byte(i), y:byte(i)))
+		out[i] = string.char(native.exor(x:sub(i, i), y:sub(i, i)):byte())
 	end
 	return table.concat(out)
 end
@@ -222,34 +79,6 @@ local function hmac_md5(key, message)
 		md5(xor_str(kp, string.rep(string.char(0x36), 64)) .. message))
 end
 
--- The pure lua code above is correct and costs 9 ms per hash on an ipq60xx,
--- because this lua has no bit library and every and/or/xor goes through the
--- nibble tables. One Access-Accept needs three to five hashes, which is the
--- 40-60 ms round trip hostapd reports. That matters: with macaddr_acl=2 the
--- access point stays silent until the answer is in, and the station gives up
--- on the authentication frame after three tries in ~330 ms — so those
--- milliseconds decide whether a roam is a fast transition or a full
--- reauthentication. The lua-md5 package does the same hash in 4 us.
---
--- Rebinding the locals is enough: hmac_md5 and the tunnel password encryption
--- reach them as upvalues and follow along. Kept optional on purpose, so an
--- access point that has not been updated yet still answers, only slowly.
-do
-	local ok, native = pcall(require, 'md5')
-	if ok and type(native) == 'table' and type(native.sum) == 'function' then
-		md5 = native.sum
-		if type(native.exor) == 'function' then
-			-- md5.exor insists on equal lengths; xor_str is called with a
-			-- short tail nowhere today, but the fallback keeps it true
-			local lua_xor = xor_str
-			xor_str = function(x, y)
-				if #x == #y then return native.exor(x, y) end
-				return lua_xor(x, y)
-			end
-		end
-		radius.native_md5 = true
-	end
-end
 
 local hexdigits = '0123456789abcdef'
 local function tohex(s)
