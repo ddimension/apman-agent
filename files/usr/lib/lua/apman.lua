@@ -17,6 +17,9 @@ have_unix = have_unix and type(unix) == 'table' and type(unix.dgram) == 'functio
 -- the optional minimal radius server (apman-radius.lua) answering hostapd
 -- wpa_psk_radius / sae psk mac queries; the feature reports itself absent
 -- when the module is not installed
+local apman_parse = require('apman-parse')
+local have_ctrl, apman_ctrl = pcall(require, 'apman-ctrl')
+have_ctrl = have_ctrl and type(apman_ctrl) == 'table'
 local have_radius, apman_radius = pcall(require, 'apman-radius')
 have_radius = have_radius and type(apman_radius) == 'table'
 
@@ -32,7 +35,6 @@ apman.client = nil
 apman.count = 0
 apman.timers = {}
 apman.ubus_session = {}
-apman.collects_stats_plugin_name = 'apman'
 
 -- runtime defaults, overridable from uci (see apman.apply_config)
 apman.status_interval = 10000		-- ms between full status publishes
@@ -75,130 +77,6 @@ apman.radius_bss_ifaces = {}		-- bssid -> uci wifi-iface section name
 apman.radius_bss_digest = nil		-- gate for the bss map watchdog in radius_reload
 apman.radius_bss_ticks = 0		-- full map refreshes every 30 ticks (5 min)
 apman.config_digest = nil		-- /etc/config/apman content the watch saw last
-
--- hostapd control channel (see apman.ctrl_request)
-apman.ctrl_dir = '/var/run/hostapd'
-apman.ctrl_enabled = true
-apman.ctrl_timeout = 3			-- s to wait for an answer
-apman.ctrl_allow_all = false		-- ignore the allowlist below
-apman.ctrl_seq = 0
-apman.ctrl_stale_cleaned = false
--- Persistent monitors on the control channel (ATTACH), one per bss.
---
--- The ubus notifications cover what a client does — probe, auth, assoc,
--- disassoc — and they arrive parsed. The control channel covers what hostapd
--- itself does, and a few things about clients that ubus loses on the way:
---
---   * AP-STA-CONNECTED carries keyid, vlanid and ip_addr, so a key handed out
---     is recognised at the moment it is used instead of on the next poll
---   * BSS-TM-RESP prints status_code as a number, while the ubus path renders
---     it through blobmsg_add_u8 and libubox turns that into a boolean
---   * why a station was refused (max sta, blocked, wrong key) and how the EAP
---     server answered — neither exists over ubus at all
---
--- Measured on a busy access point: 171 ubus notifications against 4 control
--- channel events in the same four minutes, because probe requests do not come
--- through here. The stream is cheap.
-apman.ctrl_events = true
-apman.ctrl_monitors = {}		-- ifname -> { sock, path, ufd }
-apman.ctrl_event_all = false		-- forward everything, not just the list
-apman.ctrl_event_allow = {
-	-- stations
-	['AP-STA-CONNECTED'] = true, ['AP-STA-DISCONNECTED'] = true,
-	['AP-STA-POSSIBLE-PSK-MISMATCH'] = true, ['EAPOL-4WAY-HS-COMPLETED'] = true,
-	['AP-REJECTED-MAX-STA'] = true, ['AP-REJECTED-BLOCKED-STA'] = true,
-	-- steering, with the status code the ubus path cannot carry
-	['BSS-TM-RESP'] = true, ['BSS-TM-QUERY'] = true,
-	['MBO-CELL-PREFERENCE'] = true, ['MBO-TRANSITION-REASON'] = true,
-	-- the eap server, which has no ubus equivalent
-	['CTRL-EVENT-EAP-SUCCESS2'] = true, ['CTRL-EVENT-EAP-FAILURE2'] = true,
-	['CTRL-EVENT-EAP-TIMEOUT-FAILURE2'] = true, ['CTRL-EVENT-EAP-RETRANSMIT2'] = true,
-	['EAP-ERROR-CODE'] = true,
-	-- channel life cycle
-	['ACS-STARTED'] = true, ['ACS-COMPLETED'] = true, ['ACS-FAILED'] = true,
-	['DFS-CAC-START'] = true, ['DFS-CAC-COMPLETED'] = true,
-	['DFS-RADAR-DETECTED'] = true, ['DFS-NEW-CHANNEL'] = true,
-	['DFS-NOP-FINISHED'] = true, ['DFS-PRE-CAC-EXPIRED'] = true,
-	['AP-CSA-FINISHED'] = true, ['CTRL-EVENT-CHANNEL-SWITCH'] = true,
-	['CTRL-EVENT-STARTED-CHANNEL-SWITCH'] = true,
-	['CTRL-EVENT-REGDOM-CHANGE'] = true,
-	-- bss state
-	['AP-ENABLED'] = true, ['AP-DISABLED'] = true,
-	['INTERFACE-ENABLED'] = true, ['INTERFACE-DISABLED'] = true,
-	-- radio behaviour of a client, which explains sudden slowness
-	['STA-OPMODE-MAX-BW-CHANGED'] = true, ['STA-OPMODE-SMPS-MODE-CHANGED'] = true,
-	['STA-OPMODE-N_SS-CHANGED'] = true,
-	-- measurements and protection
-	['RRM-NEIGHBOR-REP-RECEIVED'] = true, ['BEACON-REQ-TX-STATUS'] = true,
-	['LINK-MSR-RESP-RX'] = true, ['OCV-FAILURE'] = true,
-	['CTRL-EVENT-UNPROT-BEACON'] = true,
-	['PMKSA-CACHE-ADDED'] = true, ['PMKSA-CACHE-REMOVED'] = true,
-	-- wps enrolment
-	['WPS-PBC-ACTIVE'] = true, ['WPS-PIN-NEEDED'] = true, ['WPS-SUCCESS'] = true,
-	['WPS-FAIL'] = true, ['WPS-TIMEOUT'] = true, ['WPS-OVERLAP-DETECTED'] = true,
-	['WPS-ENROLLEE-SEEN'] = true, ['WPS-REG-SUCCESS'] = true, ['WPS-CANCEL'] = true,
-}
--- the built in allowlists; apply_config rebuilds the live tables from these,
--- so removing an entry in uci revokes it in the running agent
-apman.ctrl_event_allow_default = apman.ctrl_event_allow
--- BEACON-RESP-RX is deliberately absent: the ubus beacon-report notification
--- delivers the same measurement already decoded.
--- Extra detail pulled from the control channel and folded into the periodic
--- status. Both are cached and refreshed asynchronously, so building a status
--- message never waits for hostapd: what arrives lands in the next message.
---
--- The per station values (which AKM and cipher a client actually negotiated,
--- the key handshake state, its power save behaviour) do not change while the
--- association lasts, so only stations that are new or stale cost a request.
-apman.mib_interval = 60			-- s per bss, 0 = off
-apman.sta_ctrl_interval = 300		-- s per station, 0 = off
-apman.sta_ctrl_retry = 30		-- s, for stations that report no identity yet
-apman.mib_cache = {}			-- ifname -> { ts, values }
-apman.sta_ctrl_cache = {}		-- ifname -> mac -> { ts, values }
--- what is kept from a MIB reply; the rest is either constant or noise
-apman.mib_fields = {
-	'dot11RSNA4WayHandshakeFailures', 'dot11RSNATKIPCounterMeasuresInvoked',
-	'dot11RSNAAuthenticationSuiteSelected', 'dot11RSNAPairwiseCipherSelected',
-	'dot11RSNAGroupCipherSelected', 'hostapdWPAGroupState',
-	'radiusAuthServerAddress', 'radiusAuthClientServerPortNumber',
-	'radiusAuthClientRoundTripTime', 'radiusAuthClientAccessRequests',
-	'radiusAuthClientAccessAccepts', 'radiusAuthClientAccessRejects',
-	'radiusAuthClientAccessChallenges', 'radiusAuthClientAccessRetransmissions',
-	'radiusAuthClientTimeouts', 'radiusAuthClientMalformedAccessResponses',
-	'radiusAuthClientBadAuthenticators', 'radiusAuthClientPendingRequests',
-}
--- and from a STA reply
-apman.sta_ctrl_fields = {
-	-- keyid names the entry of the wpa_psk_file a station authenticated with,
-	-- which is the only way to tell apart clients that share a wildcard mac
-	'keyid',
-	'AKMSuiteSelector', 'dot11RSNAStatsSelectedPairwiseCipher',
-	'hostapdWPAPTKState', 'hostapdWPAPTKGroupState', 'hostapdMFPR',
-	'capability', 'listen_interval', 'supported_rates', 'timeout_next',
-	'dot11RSNAStatsTKIPLocalMICFailures', 'dot11RSNAStatsTKIPRemoteMICFailures',
-	'wpa', 'ht_caps_info', 'vht_caps_info', 'he_caps_info',
-}
--- Commands the controller may send. Everything here either reads state or does
--- something the ubus interface cannot do at all. Deliberately absent:
--- DISASSOCIATE, DEAUTHENTICATE, DENY_ACL/ACCEPT_ACL add/del, RELOAD, DISABLE —
--- they either exist over ubus already or cut clients off, and a command
--- channel without authentication should not offer them by default.
--- 'option ctrl_allow_all 1' lifts this, 'list ctrl_allow <VERB>' extends it.
-apman.ctrl_allowed = {
-	['STATUS'] = true, ['STATUS-DRIVER'] = true, ['GET_CONFIG'] = true,
-	['MIB'] = true, ['STA'] = true, ['STA-FIRST'] = true, ['STA-NEXT'] = true,
-	['SIGNATURE'] = true, ['SHOW_NEIGHBOR'] = true, ['GET_CAPABILITY'] = true,
-	['DENY_ACL'] = true, ['ACCEPT_ACL'] = true,
-	['RELOAD_WPA_PSK'] = true, ['BSS_TM_REQ'] = true,
-	-- withdrawing a key needs this: a station that was deauthenticated
-	-- comes back through its cached PMKSA without running SAE or the four
-	-- way handshake again, and would keep using the key that was just
-	-- taken away (measured 2026-08-21, auth_alg=open on an SAE bss)
-	['PMKSA_FLUSH'] = true,
-	['WPS_PIN'] = true, ['WPS_PBC'] = true, ['WPS_CANCEL'] = true,
-	['REQ_BEACON'] = true, ['REQ_LINK_MEASUREMENT'] = true,
-}
-apman.ctrl_allowed_default = apman.ctrl_allowed
 
 -- ubus status codes, so a consumer gets a reason instead of a bare null
 apman.ubus_status_text = {
@@ -488,46 +366,6 @@ function apman.collect_station_dumps(devlist)
 	return result
 end
 
--- Turn the station dump text into a map station -> fields.
---
--- The consumer used to do this with string operations on every status message,
--- ten times a second in a single process. Doing it here spreads the work over
--- the access points and it only happens once per interval anyway. Payload
--- version 2 marks the structured form.
-function apman.parse_station_dump(text)
-	local stations = {}
-	local current = nil
-	local pos, len = 1, #text
-
-	while pos <= len do
-		local line
-		local nl = string.find(text, "\n", pos, true)
-		if nl then
-			line = string.sub(text, pos, nl - 1)
-			pos = nl + 1
-		else
-			line = string.sub(text, pos)
-			pos = len + 1
-		end
-
-		local mac = string.match(line, "^Station (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-		if mac ~= nil then
-			current = string.lower(mac)
-			stations[current] = { device = string.match(line, "%(on (%S+)%)") }
-		elseif current ~= nil then
-			local key, value = string.match(line, "^%s*(.-):%s*(.*)$")
-			if key ~= nil and key ~= '' then
-				-- same normalisation the consumer used, so the field names
-				-- stay the ones everything downstream already knows
-				key = string.gsub(key, "[ ,%.%-/]", "_")
-				stations[current][key] = value
-			end
-		end
-	end
-
-	return stations
-end
-
 -- timer entry: the cycle below runs in a pcall, so a hiccup in one ubus
 -- answer (or a connection that died mid-call) cannot take the whole agent
 -- down, and a cycle that runs longer than the interval is logged instead of
@@ -661,7 +499,7 @@ function apman.status_cycle()
 					stations = stations .. "\n" .. (dumps[subdevice] or "")
 				end
 			end
-			data['devices'][value]['stations'] = apman.parse_station_dump(stations)
+			data['devices'][value]['stations'] = apman_parse.station_dump(stations)
 		end
 
 		-- control channel detail: what is cached goes out now, what aged out
@@ -675,13 +513,13 @@ function apman.status_cycle()
 				end
 			end
 		end
-		apman.refresh_mib(value)
-		apman.refresh_sta_ctrl(value, macs)
-		local mib = apman.mib_cache[value]
+		apman_ctrl.refresh_mib(value)
+		apman_ctrl.refresh_sta_ctrl(value, macs)
+		local mib = apman_ctrl.mib_cache[value]
 		if mib ~= nil and mib.values ~= nil then
 			data['devices'][value]['mib'] = mib.values
 		end
-		data['devices'][value]['sta_ctrl'] = apman.sta_ctrl_values(value)
+		data['devices'][value]['sta_ctrl'] = apman_ctrl.sta_ctrl_values(value)
 
 		topic = apman.ap_topic('device/hostapd/' .. value .. '/status')
 		apman.publish_mqtt( topic , cjson.encode(data['devices'][value]))
@@ -809,7 +647,7 @@ function apman.subscribe_ubus()
 			monitored[object:gsub('^hostapd%.', '')] = true
 		end
 	end
-	apman.ctrl_monitor_sync(monitored)
+	apman_ctrl.monitor_sync(monitored)
 	-- the global 'hostapd' object only exists with the ucode based hostapd;
 	-- its bss.add/bss.remove/bss.reload notifications replace the poll
 	apman.have_bss_events = available['hostapd'] == true
@@ -1120,429 +958,6 @@ function apman.on_mqtt_connect(success, rc, str)
 end
 
 -- validates a jsonrpc request, returns nil or an error object
--- The hostapd control channel, proxied.
---
--- hostapd listens on a unix DATAGRAM socket per bss (plus a global one) even
--- though the ubus interface is up — the two are independent and several
--- clients may talk at once, which is how hostapd_cli and wpa_cli coexist. It
--- reaches things ubus does not expose: RELOAD_WPA_PSK (reload the psk file
--- without touching associations), WPS_PIN with an argument, and BSS_TM_REQ
--- whose response event carries the transition status as text instead of the
--- u8 that libubox renders as a boolean.
---
--- Two traps, both found the hard way:
---
---  * hostapd runs inside a ujail as user 'network'. A reply socket in /tmp is
---    invisible to it and the request simply times out. It has to live in
---    ctrl_dir, which the jail has read-write.
---  * a socket bound by root is 0755, so hostapd may not write back. It needs
---    to be world writable before the request goes out.
-function apman.ctrl_verb(command)
-	local verb = string.match(tostring(command), '^%s*([%w_-]+)')
-	return verb and string.upper(verb) or nil
-end
-
-function apman.ctrl_permitted(command)
-	if apman.ctrl_allow_all then
-		return true
-	end
-	local verb = apman.ctrl_verb(command)
-	return verb ~= nil and apman.ctrl_allowed[verb] == true
-end
-
--- ask one bss and call back with the raw answer; never blocks the uloop
-function apman.ctrl_request(iface, command, callback)
-	if not apman.ctrl_enabled then
-		return callback(nil, { code = 8, message = 'control channel proxy disabled' })
-	end
-	if not have_unix then
-		return callback(nil, { code = 8, message = 'luasocket without unix socket support' })
-	end
-	if type(iface) ~= 'string' or iface == '' or string.find(iface, '[/%s]') ~= nil then
-		return callback(nil, { code = 2, message = 'invalid interface name' })
-	end
-	if type(command) ~= 'string' or command == '' then
-		return callback(nil, { code = 2, message = 'command must be a non empty string' })
-	end
-	if not apman.ctrl_permitted(command) then
-		return callback(nil, { code = 6, message = 'command not allowed: ' ..
-			tostring(apman.ctrl_verb(command)) })
-	end
-
-	local target = apman.ctrl_dir .. '/' .. iface
-	apman.ctrl_seq = apman.ctrl_seq + 1
-	local path = string.format('%s/apman-%d-%d', apman.ctrl_dir, apman.pid or 0, apman.ctrl_seq)
-
-	local sock = unix.dgram()
-	if sock == nil then
-		return callback(nil, { code = 11, message = 'cannot create socket' })
-	end
-
-	local done = false
-	local ufd, timer
-	local function cleanup()
-		if ufd ~= nil then pcall(function() ufd:delete() end) end
-		if timer ~= nil then pcall(function() timer:cancel() end) end
-		pcall(function() sock:close() end)
-		os.remove(path)
-	end
-	local function finish(reply, err)
-		if done then
-			return
-		end
-		done = true
-		cleanup()
-		callback(reply, err)
-	end
-
-	local ok, err = sock:bind(path)
-	if not ok then
-		cleanup()
-		return callback(nil, { code = 13, message = 'bind failed: ' .. tostring(err) })
-	end
-	-- hostapd is not root, it has to be able to answer
-	os.execute("chmod 0777 '" .. path .. "' 2>/dev/null")
-
-	ok, err = sock:connect(target)
-	if not ok then
-		cleanup()
-		return callback(nil, { code = 4, message = 'no control socket for ' .. iface })
-	end
-	sock:settimeout(0)
-
-	ok, err = sock:send(command)
-	if not ok then
-		cleanup()
-		return callback(nil, { code = 13, message = 'send failed: ' .. tostring(err) })
-	end
-
-	ufd = uloop.fd_add(sock, function()
-		local reply = sock:receive(65536)
-		if reply == nil then
-			return		-- spurious wakeup, keep waiting for the deadline
-		end
-		finish(reply, nil)
-	end, uloop.ULOOP_READ)
-
-	timer = uloop.timer(function()
-		finish(nil, { code = 7, message = 'no answer from hostapd within ' ..
-			apman.ctrl_timeout .. ' s' })
-	end, apman.ctrl_timeout * 1000)
-end
-
--- hostapd answers in "key=value" lines, sometimes with a bare first line (the
--- station address in a STA dump). Both forms are handed on: the raw text so
--- nothing is lost, and the parsed pairs so a consumer does not have to.
-function apman.ctrl_parse(reply)
-	local values, lines = {}, {}
-	for line in string.gmatch(reply, '[^\n]+') do
-		lines[#lines + 1] = line
-		local key, value = string.match(line, '^([^=]+)=(.*)$')
-		if key ~= nil then
-			values[key] = value
-		end
-	end
-
-	return { raw = reply, values = values, lines = lines }
-end
-
--- One line of the control channel event stream.
---
---   <3>AP-STA-CONNECTED 00:11:22:33:44:55 auth_alg=open keyid=17-anna vlanid=7
---
--- The number in brackets is the syslog priority, then the event name, then an
--- optional station address and free "key=value" fields.
-function apman.ctrl_event_parse(msg)
-	local line = string.gsub(msg, '\n+$', '')
-	local priority, rest = string.match(line, '^<(%d+)>(.*)$')
-	if rest == nil then
-		priority, rest = nil, line
-	end
-	local name, tail = string.match(rest, '^(%S+)%s*(.*)$')
-	if name == nil then
-		return nil
-	end
-
-	local event = {
-		event = name,
-		priority = priority and tonumber(priority) or nil,
-		fields = {},
-		raw = rest,
-		timestamp = socket.gettime(),
-	}
-	local address = string.match(tail, '^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)')
-	if address ~= nil then
-		event['address'] = string.lower(address)
-	end
-	for key, value in string.gmatch(tail, '([%w_%-]+)=(%S+)') do
-		event['fields'][key] = value
-	end
-
-	return event
-end
-
-function apman.ctrl_event_wanted(name)
-	return apman.ctrl_event_all or apman.ctrl_event_allow[name] == true
-end
-
--- read whatever is queued on a monitor socket and forward it
-function apman.ctrl_monitor_read(iface)
-	local monitor = apman.ctrl_monitors[iface]
-	if monitor == nil then
-		return
-	end
-	for _ = 1, 32 do
-		local msg = monitor.sock:receive(8192)
-		if msg == nil then
-			return
-		end
-		local event = apman.ctrl_event_parse(msg)
-		-- A station that (re)associates may have used a different key than the
-		-- one we cached for it, and the cached entry would otherwise stand for
-		-- up to sta_ctrl_interval seconds. Dropping it here is what keeps the
-		-- reported identity honest: the next status cycle asks hostapd again.
-		if event ~= nil and event['address'] ~= nil
-				and (event['event'] == 'AP-STA-CONNECTED'
-					or event['event'] == 'AP-STA-DISCONNECTED') then
-			local cache = apman.sta_ctrl_cache[iface]
-			if cache ~= nil then
-				cache[event['address']] = nil
-			end
-		end
-		if event ~= nil and apman.ctrl_event_wanted(event['event']) then
-			event['ifname'] = iface
-			apman.publish_mqtt(
-				apman.ap_topic('notifications/hostapd/' .. iface .. '/ctrl/' .. event['event']),
-				cjson.encode(event))
-		end
-	end
-end
-
--- Sockets of an earlier run of this agent. The file name carries the pid, so a
--- restart leaves one orphan per bss behind — harmless, but they pile up in the
--- directory hostapd uses and it keeps sending to them until the writes fail.
-function apman.ctrl_cleanup_stale()
-	if apman.pid == nil then
-		return
-	end
-	os.execute(string.format(
-		"for f in %s/apman-*; do case \"$f\" in *-%d-*) ;; *) rm -f \"$f\";; esac; done 2>/dev/null",
-		apman.ctrl_dir, apman.pid))
-end
-
--- attach to one bss; the reply socket has to live where the ujail can write
-function apman.ctrl_monitor_attach(iface)
-	if apman.ctrl_monitors[iface] ~= nil then
-		return true
-	end
-	if not apman.ctrl_events or not apman.ctrl_enabled or not have_unix then
-		return false
-	end
-
-	local path = string.format('%s/apman-mon-%d-%s', apman.ctrl_dir, apman.pid or 0, iface)
-	os.remove(path)
-	local sock = unix.dgram()
-	if sock == nil then
-		return false
-	end
-	local ok = sock:bind(path)
-	if not ok then
-		pcall(function() sock:close() end)
-		return false
-	end
-	os.execute("chmod 0777 '" .. path .. "' 2>/dev/null")
-	if not sock:connect(apman.ctrl_dir .. '/' .. iface) then
-		pcall(function() sock:close() end)
-		os.remove(path)
-		return false
-	end
-	sock:settimeout(0)
-	if not sock:send('ATTACH') then
-		pcall(function() sock:close() end)
-		os.remove(path)
-		return false
-	end
-
-	apman.ctrl_monitors[iface] = { sock = sock, path = path }
-	apman.ctrl_monitors[iface].ufd = uloop.fd_add(sock, function()
-		apman.ctrl_monitor_read(iface)
-	end, uloop.ULOOP_READ)
-	print(string.format('Attached to the control channel of %s', iface))
-
-	return true
-end
-
-function apman.ctrl_monitor_drop(iface)
-	local monitor = apman.ctrl_monitors[iface]
-	if monitor == nil then
-		return
-	end
-	apman.ctrl_monitors[iface] = nil
-	if monitor.ufd ~= nil then
-		pcall(function() monitor.ufd:delete() end)
-	end
-	-- DETACH is a courtesy: hostapd drops a monitor that stops answering
-	pcall(function() monitor.sock:send('DETACH') end)
-	pcall(function() monitor.sock:close() end)
-	os.remove(monitor.path)
-	print(string.format('Detached from the control channel of %s', iface))
-end
-
--- let go of every bss and take the reply sockets with us.
---
--- procd sends SIGTERM on stop and lua ends there, so without this the sockets
--- of the dying process stay in ctrl_dir until the next start sweeps them up in
--- ctrl_cleanup_stale(). They do not pile up across restarts, but they do
--- outlive the service, and hostapd is left holding a monitor that will never
--- answer again instead of being told we are going.
-function apman.ctrl_shutdown()
-	for iface in pairs(apman.ctrl_monitors) do
-		apman.ctrl_monitor_drop(iface)
-	end
-end
-
--- Deliberately no signal handler here.
---
--- uloop.signal(callback, signum) does register on this build and returns a
--- handle, but the callback is never invoked — and registering it stops the
--- default action too, so a process with a "handler" survives SIGTERM instead
--- of dying. Measured: a test that registers for SIGTERM, gets sent SIGTERM,
--- and runs on to its own timeout. Using it would leave an agent that cannot be
--- stopped, which is a great deal worse than a few socket files.
---
--- So the sockets are removed by the init script when the service stops, and
--- ctrl_cleanup_stale() sweeps whatever survived that on the next start.
-
--- called whenever the bss list changed: attach to what is new, let go of what
--- disappeared. hostapd forgets its monitors when it restarts, and the same
--- bss.reload notification that triggers the ubus resubscribe brings us here.
-function apman.ctrl_monitor_sync(wanted)
-	if not apman.ctrl_stale_cleaned then
-		apman.ctrl_stale_cleaned = true
-		apman.ctrl_cleanup_stale()
-	end
-	if not apman.ctrl_events then
-		for iface in pairs(apman.ctrl_monitors) do
-			apman.ctrl_monitor_drop(iface)
-		end
-		return
-	end
-	for iface in pairs(apman.ctrl_monitors) do
-		if wanted[iface] ~= true then
-			apman.ctrl_monitor_drop(iface)
-		end
-	end
-	for iface in pairs(wanted) do
-		apman.ctrl_monitor_attach(iface)
-	end
-end
-
--- keep only the interesting keys of a control channel answer
-function apman.ctrl_pick(values, fields)
-	local out, found = {}, false
-	for _, key in ipairs(fields) do
-		if values[key] ~= nil then
-			out[key] = values[key]
-			found = true
-		end
-	end
-	if not found then
-		return nil
-	end
-
-	return out
-end
-
--- refresh the cached MIB of a bss if it aged out; the answer lands in the
--- cache and is published with the next status message
-function apman.refresh_mib(ifname)
-	if apman.mib_interval <= 0 or not apman.ctrl_enabled or not have_unix then
-		return
-	end
-	local now = socket.gettime()
-	local entry = apman.mib_cache[ifname]
-	if entry ~= nil and (now - entry.ts) < apman.mib_interval then
-		return
-	end
-	-- mark first, so a slow hostapd does not collect a queue of requests
-	apman.mib_cache[ifname] = { ts = now, values = entry and entry.values or nil }
-	apman.ctrl_request(ifname, 'MIB', function(reply, err)
-		if err ~= nil then
-			return
-		end
-		local parsed = apman.ctrl_parse(reply)
-		apman.mib_cache[ifname] = {
-			ts = socket.gettime(),
-			values = apman.ctrl_pick(parsed.values, apman.mib_fields),
-		}
-	end)
-end
-
--- same for the per station detail, but only for stations we do not know yet
-function apman.refresh_sta_ctrl(ifname, macs)
-	if apman.sta_ctrl_interval <= 0 or not apman.ctrl_enabled or not have_unix then
-		return
-	end
-	local now = socket.gettime()
-	local cache = apman.sta_ctrl_cache[ifname]
-	if cache == nil then
-		cache = {}
-		apman.sta_ctrl_cache[ifname] = cache
-	end
-
-	local present = {}
-	for _, mac in ipairs(macs) do
-		local key = string.lower(mac)
-		present[key] = true
-		local entry = cache[key]
-		-- A station that has no identity yet is asked again far more often:
-		-- hostapd only assigns the keyid at authentication time, so a client
-		-- that just (re)joined would otherwise stay anonymous for a whole
-		-- interval — which is exactly the moment somebody is watching to see
-		-- whether a key they handed out works.
-		local interval = apman.sta_ctrl_interval
-		if entry ~= nil and (entry.values == nil or entry.values['keyid'] == nil) then
-			interval = math.min(interval, apman.sta_ctrl_retry)
-		end
-		if entry == nil or (now - entry.ts) >= interval then
-			cache[key] = { ts = now, values = entry and entry.values or nil }
-			apman.ctrl_request(ifname, 'STA ' .. key, function(reply, err)
-				if err ~= nil then
-					return
-				end
-				local parsed = apman.ctrl_parse(reply)
-				cache[key] = {
-					ts = socket.gettime(),
-					values = apman.ctrl_pick(parsed.values, apman.sta_ctrl_fields),
-				}
-			end)
-		end
-	end
-	-- a station that left must not linger in the next status message
-	for key in pairs(cache) do
-		if not present[key] then
-			cache[key] = nil
-		end
-	end
-end
-
--- the cached values as they go into the status payload
-function apman.sta_ctrl_values(ifname)
-	local cache = apman.sta_ctrl_cache[ifname]
-	if cache == nil then
-		return nil
-	end
-	local out, found = {}, false
-	for mac, entry in pairs(cache) do
-		if entry.values ~= nil then
-			out[mac] = entry.values
-			found = true
-		end
-	end
-
-	return found and out or nil
-end
-
 function apman.validate_rpc(cmd)
 	if type(cmd) ~= 'table' then
 		return { code = 12, message = 'payload is not an object' }
@@ -1585,17 +1000,17 @@ function apman.execute_rpc(cmd, done)
 	if cmd['method'] == 'ctrl' then
 		local iface, command = cmd['params'][2], cmd['params'][3]
 		print(string.format("ctrl %s: %s", iface, apman.trunc(command)))
-		apman.ctrl_request(iface, command, function(reply, cerr)
+		apman_ctrl.request(iface, command, function(reply, cerr)
 			if cerr ~= nil then
 				response['error'] = {
 					code = cerr.code,
 					message = cerr.message,
 					object = iface,
-					method = apman.ctrl_verb(command),
+					method = apman_ctrl.verb(command),
 				}
 				print(string.format("ctrl %s failed: %s", iface, cerr.message))
 			else
-				response['result'] = apman.ctrl_parse(reply)
+				response['result'] = apman_ctrl.parse(reply)
 				response['ubus_status'] = 0
 				print(string.format("ctrl %s ok: %s", iface, apman.trunc(reply)))
 			end
@@ -1762,11 +1177,11 @@ function apman.publish_agent()
 	feature('station_dump', apman.station_dump)
 	feature('survey', apman.survey_interval > 0)
 	feature('assoclist_device', true)
-	feature('ctrl_proxy', apman.ctrl_enabled and have_unix)
+	feature('ctrl_proxy', apman_ctrl.enabled and have_unix)
 	feature('radius_psk', apman.radius_active)
-	feature('mib', apman.ctrl_enabled and have_unix and apman.mib_interval > 0)
-	feature('sta_ctrl', apman.ctrl_enabled and have_unix and apman.sta_ctrl_interval > 0)
-	feature('ctrl_events', apman.ctrl_events and apman.ctrl_enabled and have_unix)
+	feature('mib', apman_ctrl.enabled and have_unix and apman_ctrl.mib_interval > 0)
+	feature('sta_ctrl', apman_ctrl.enabled and have_unix and apman_ctrl.sta_ctrl_interval > 0)
+	feature('ctrl_events', apman_ctrl.events and apman_ctrl.enabled and have_unix)
 
 	local info = {
 		agent = 'apman',
@@ -1992,15 +1407,6 @@ function apman.radius_reload()
 	end
 end
 
--- 12 bare hex chars -> aa:bb:cc:dd:ee:ff, the format the controller and
--- every log reader expects; anything else passes through untouched
-function apman.format_mac(hex)
-	if type(hex) == 'string' and #hex == 12 then
-		return hex:gsub('(%x%x)(%x%x)(%x%x)(%x%x)(%x%x)(%x%x)', '%1:%2:%3:%4:%5:%6')
-	end
-	return hex
-end
-
 -- a radius accept/reject/drop. Accepts and rejects go to the broker, one
 -- topic per bss: the controller can match the event against the bss it
 -- configured, and Called-Station-Id gives us the bssid for free. The key
@@ -2014,10 +1420,10 @@ function apman.on_radius_event(event)
 	-- string.format once evaluated to nil for events without a vid and
 	-- killed every event (print, and with it the publish) silently
 	local line = 'radius ' .. tostring(event.decision) .. ' '
-		.. tostring(event.mac and apman.format_mac(event.mac) or '?')
+		.. tostring(event.mac and apman_parse.format_mac(event.mac) or '?')
 	if event.key then line = line .. ' key=' .. tostring(event.key) end
 	if event.key_source then line = line .. ' from=' .. tostring(event.key_source) end
-	if event.bssid then line = line .. ' bss=' .. tostring(apman.format_mac(event.bssid)) end
+	if event.bssid then line = line .. ' bss=' .. tostring(apman_parse.format_mac(event.bssid)) end
 	if event.ssid then line = line .. ' ssid=' .. tostring(event.ssid) end
 	if event.akm then line = line .. ' akm=' .. tostring(event.akm) end
 	if event.vid then
@@ -2032,7 +1438,7 @@ function apman.on_radius_event(event)
 	-- to the controller in the event below.
 	if event.unbound_keys ~= nil then
 		print('radius-error ' .. tostring(event.unbound_keys) .. ' unbound keys on ssid='
-			.. tostring(event.ssid) .. ', ' .. tostring(event.mac and apman.format_mac(event.mac) or '?')
+			.. tostring(event.ssid) .. ', ' .. tostring(event.mac and apman_parse.format_mac(event.mac) or '?')
 			.. ' was offered ' .. tostring(event.key)
 			.. ' — the others cannot enrol until it binds')
 	end
@@ -2050,264 +1456,6 @@ function apman.on_mqtt_disconnect(success, rc, str)
 	apman.mqtt_backoff = 0
 	apman.mqtt_next_attempt = socket.gettime() + apman.mqtt_backoff_next()
 	return
-end
-
-function apman.getCollectdStats()
-	apman.connect_ubus()
-	if not apman.conn then
-		error("Failed to connect to ubus")
-		return 1
-	end
-
-	-- config
-	if not apman.hostname then
-		print("Resolving Hostname")
-		result = apman.conn:call("uci", "get", {["config"] = "system",["section"] = "main",["option"] = "hostname"})
-		if type(result) ~= 'table' or result.value == nil then
-			result = apman.conn:call("uci", "get", {["config"] = "system",["section"] = "@system[0]",["option"] = "hostname"})
-		end
-		if type(result) ~= 'table' or result.value == nil then
-			print("Failed to get hostname")
-			apman.conn:close()
-			return 1
-		end
-		apman.hostname = result.value
-	end
-
-
-        local network_wireless_status = apman.conn:call("network.wireless", "status", {})
-	local dev2radio = {}
-	local radio_stats = {}
-	if type(network_wireless_status) ~= 'table' then
-		print("collectd: network.wireless status not available, skipping this read")
-		apman.conn:close()
-		return 1
-	end
-        for radio, value in pairs(network_wireless_status) do
-		if type(value) ~= 'table' then
-			radio_stats[ radio ] = { stations = 0 }
-		else
-			radio_stats[ radio ] = {}
-			radio_stats[ radio ][ 'stations' ] = 0
-			radio_stats[ radio ][ 'up' ] = value['up']
-
-			if type(value['interfaces']) == 'table' then
-				for interface, ifconfig in pairs(value['interfaces']) do
-					if type(ifconfig) == 'table' and ifconfig['ifname'] ~= nil then
-						dev2radio[ ifconfig['ifname'] ] = radio
-					end
-				end
-			end
-		end
-	end
-
-        local devices = apman.conn:call("iwinfo", "devices", {})
-        local slaves = {}
-        local masters = {}
-	if type(devices) ~= 'table' or type(devices['devices']) ~= 'table' then
-		print("collectd: iwinfo device list not available, skipping this read")
-		apman.conn:close()
-		return 1
-	end
-        for key, value in pairs(devices['devices']) do
-                local i,j, masterdev
-		masterdev = value
-                i, j = string.find(value, '.sta')
-                if i ~= nil then
-                        local master = string.sub(value, 0, i-1)
-                        if slaves[master] == nil then
-                                slaves[master] = {}
-                        end
-			masterdev = master
-                        table.insert(slaves[master], value)
-                else
-                        table.insert(masters, value)
-                end
-		if dev2radio[masterdev] ~= nil then
-			local radio = dev2radio[masterdev]
-			status = apman.conn:call("network.device", "status", {name = value})
-			if type(status) == 'table' and type(status['statistics']) == 'table' then
-				if radio_stats[radio]['statistics'] == nil then
-					radio_stats[radio]['statistics'] = status['statistics']
-				else
-					for k2, v2 in pairs(status['statistics']) do
-						if radio_stats[radio]['statistics'][k2] == nil then
-							radio_stats[radio]['statistics'][k2] = v2
-						else
-							radio_stats[radio]['statistics'][k2] = radio_stats[radio]['statistics'][k2] + v2
-						end
-					end
-				end
-			end
-		end
-        end
-
---	collectd.log_info('debug radiostats: '..cjson.encode(radio_stats))
-        for key, value in pairs(masters) do
-                status = apman.conn:call("hostapd."..value, "get_status", {})
-		radio = dev2radio[ value ]
-		if type(status) == 'table' then
-			if status['airtime'] and type(status['airtime']) == 'table' then
-				if status['airtime']['time'] ~= nil
-						and status['airtime']['time_busy'] ~= nil
-						and status['airtime']['utilization'] ~= nil then
-					local t = {
-						host = apman.hostname,
-						plugin = apman.collects_stats_plugin_name,
-						plugin_instance = value,
-						type = 'wifi_airtime',
-						values = {status['airtime']['time'], status['airtime']['time_busy'], status['airtime']['utilization']}
-					}
-					collectd.dispatch_values(t)
-					if radio ~= nil and radio_stats[radio] ~= nil then
-						radio_stats[radio]['airtime'] = t.values
-					end
-
-				end
-			end
-
-			if status['dfs'] and type(status['dfs']) == 'table' then
-				if status['dfs']['cac_seconds'] ~= nil
-						and status['dfs']['cac_seconds_left'] ~= nil
-						and status['dfs']['cac_active'] ~= nil then
-					local t = {
-						host = apman.hostname,
-						plugin = apman.collects_stats_plugin_name,
-						plugin_instance = value,
-						type = 'wifi_dfs',
-						values = {status['dfs']['cac_seconds'], status['dfs']['cac_seconds_left'], status['dfs']['cac_active']}
-					}
-					collectd.dispatch_values(t)
-					if radio ~= nil and radio_stats[radio] ~= nil then
-						radio_stats[radio]['dfs'] = t.values
-					end
-				end
-			end
-
-			if status['channel'] and status['freq'] and status['status'] then
-				local chan_stat = 0
-				if status['status'] == 'ENABLED' then
-					chan_stat = 1
-				end
-				local t = {
-					host = apman.hostname,
-					plugin = apman.collects_stats_plugin_name,
-					plugin_instance = value,
-					type = 'wifi_channel',
-					values = {status['channel'], status['freq'], chan_stat}
-				}
-				collectd.dispatch_values(t)
-				if radio ~= nil and radio_stats[radio] ~= nil then
-					radio_stats[radio]['wifi_channel'] = t.values
-				end
-			end
-		end
-
-                clients = apman.conn:call("hostapd."..value, "get_clients", {})
-		if radio ~= nil and type(clients) == 'table' and type(clients['clients']) == 'table' then
-			for a3, b3 in pairs(clients['clients']) do
-				radio_stats[radio]['stations'] = radio_stats[radio]['stations'] + 1
-			end
-		end
-        end
-
-	for radio, stats in pairs(radio_stats) do
-		if stats['airtime'] ~= nil then
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'wifi_airtime',
-				values = stats['airtime']
-			}
-			collectd.dispatch_values(t)
-		end
-		if stats['dfs'] ~= nil then
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'wifi_dfs',
-				values = stats['dfs']
-			}
-			collectd.dispatch_values(t)
-		end
-		if stats['wifi_channel'] ~= nil then
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'wifi_channel',
-				values = stats['wifi_channel']
-			}
-			collectd.dispatch_values(t)
-		end
-		if stats['stations'] ~= nil then
-			local t = {
-				host = apman.hostname,
-				plugin = apman.collects_stats_plugin_name,
-				plugin_instance = radio,
-				type = 'stations',
-				values = {stats['stations']}
-			}
-			collectd.dispatch_values(t)
-		end
-		if stats['statistics'] ~= nil then
-			-- every counter pair is dispatched on its own: a key netifd does
-			-- not report must not take the whole read down with it
-			local rx, tx = stats['statistics']['rx_bytes'], stats['statistics']['tx_bytes']
-			if rx ~= nil and tx ~= nil then
-				local t = {
-					host = apman.hostname,
-					plugin = apman.collects_stats_plugin_name,
-					plugin_instance = radio,
-					type = 'if_octets',
-					values = {rx % 1073741824, tx % 1073741824}
-				}
-				collectd.dispatch_values(t)
-			end
-
-			rx, tx = stats['statistics']['rx_packets'], stats['statistics']['tx_packets']
-			if rx ~= nil and tx ~= nil then
-				local t = {
-					host = apman.hostname,
-					plugin = apman.collects_stats_plugin_name,
-					plugin_instance = radio,
-					type = 'if_packets',
-					values = {rx, tx}
-				}
-				collectd.dispatch_values(t)
-			end
-
-			rx, tx = stats['statistics']['rx_dropped'], stats['statistics']['tx_dropped']
-			if rx ~= nil and tx ~= nil then
-				local t = {
-					host = apman.hostname,
-					plugin = apman.collects_stats_plugin_name,
-					plugin_instance = radio,
-					type = 'if_dropped',
-					values = {rx, tx}
-				}
-				collectd.dispatch_values(t)
-			end
-
-			rx, tx = stats['statistics']['rx_errors'], stats['statistics']['tx_errors']
-			if rx ~= nil and tx ~= nil then
-				local t = {
-					host = apman.hostname,
-					plugin = apman.collects_stats_plugin_name,
-					plugin_instance = radio,
-					type = 'if_errors',
-					values = {rx, tx}
-				}
-				collectd.dispatch_values(t)
-			end
-		end
-	end
-
-	apman.conn:close()
-	return 0
-
 end
 
 function apman.init()
@@ -2530,40 +1678,31 @@ function apman.apply_config()
 	apman.radius_wifi_config = apman.cfg('radius_wifi_config', '/etc/config/wireless')
 	apman.radius_reload_interval = apman.cfg_num('radius_reload_interval', 10)
 
-	apman.ctrl_enabled = apman.cfg_bool('ctrl_enabled', true)
-	apman.ctrl_allow_all = apman.cfg_bool('ctrl_allow_all', false)
-	apman.ctrl_timeout = apman.cfg_num('ctrl_timeout', 3)
-	apman.mib_interval = apman.cfg_num('mib_interval', 60)
-	apman.sta_ctrl_interval = apman.cfg_num('sta_ctrl_interval', 300)
-	apman.sta_ctrl_retry = apman.cfg_num('sta_ctrl_retry', 30)
-	apman.ctrl_dir = apman.cfg('ctrl_dir', apman.ctrl_dir)
-	apman.ctrl_events = apman.cfg_bool('ctrl_events', true)
-	apman.ctrl_event_all = apman.cfg_bool('ctrl_event_all', false)
-	-- rebuilt from the built in defaults every time: a verb or event that
-	-- was added by a previous config must not survive its removal in uci
-	apman.ctrl_event_allow = {}
-	for event in pairs(apman.ctrl_event_allow_default) do
-		apman.ctrl_event_allow[event] = true
-	end
-	for _, name in ipairs(apman.cfg_list('ctrl_event_allow', {})) do
-		apman.ctrl_event_allow[string.upper(name)] = true
-	end
-	for _, name in ipairs(apman.cfg_list('ctrl_event_deny', {})) do
-		apman.ctrl_event_allow[string.upper(name)] = nil
-	end
-	apman.ctrl_allowed = {}
-	for verb in pairs(apman.ctrl_allowed_default) do
-		apman.ctrl_allowed[verb] = true
-	end
-	for _, verb in ipairs(apman.cfg_list('ctrl_allow', {})) do
-		apman.ctrl_allowed[string.upper(verb)] = true
-	end
+	apman_ctrl.bind({ ap_topic = apman.ap_topic, publish = apman.publish_mqtt })
+	apman_ctrl.configure({
+		enabled = apman.cfg_bool('ctrl_enabled', true),
+		allow_all = apman.cfg_bool('ctrl_allow_all', false),
+		timeout = apman.cfg_num('ctrl_timeout', 3),
+		dir = apman.cfg('ctrl_dir', apman_ctrl.dir),
+		events = apman.cfg_bool('ctrl_events', true),
+		event_all = apman.cfg_bool('ctrl_event_all', false),
+		mib_interval = apman.cfg_num('mib_interval', 60),
+		sta_ctrl_interval = apman.cfg_num('sta_ctrl_interval', 300),
+		sta_ctrl_retry = apman.cfg_num('sta_ctrl_retry', 30),
+		event_allow_add = apman.cfg_list('ctrl_event_allow', {}),
+		event_allow_drop = apman.cfg_list('ctrl_event_deny', {}),
+		allow_add = apman.cfg_list('ctrl_allow', {}),
+	})
 	-- the reply socket name has to be unique per process and request
 	local stat = io.open('/proc/self/stat')
 	if stat ~= nil then
 		apman.pid = tonumber(string.match(stat:read('*l') or '', '^(%d+)'))
 		stat:close()
 	end
+	-- after the pid is known, not with the rest of the binding above: the
+	-- control channel names its reply sockets with it, and a nil there puts
+	-- two processes on the same path
+	apman_ctrl.opts.pid = apman.pid
 
 	-- seed per host, otherwise every ap of a fleet draws the same backoff
 	local seed = math.floor(socket.gettime() * 1000) % 2147483647

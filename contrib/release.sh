@@ -88,11 +88,9 @@ rollout() {
 	local ap="$1" changed_collectd=0
 	say "rollout auf $ap"
 	ssh -o BatchMode=yes "root@$ap" 'mkdir -p /usr/lib/lua /usr/bin /usr/share/collectd /lib/upgrade/keep.d /etc/collectd/conf.d /etc/apman'
-	scp -O -q -o BatchMode=yes \
-		"$ROOT"/files/usr/lib/lua/apman.lua \
-		"$ROOT"/files/usr/lib/lua/apman-collectd.lua \
-		"$ROOT"/files/usr/lib/lua/apman-radius.lua \
-		"root@$ap:/usr/lib/lua/"
+	# every lua file, not a list: the modules are split by concern now and a
+	# list is a thing you forget to extend on the day it matters
+	scp -O -q -o BatchMode=yes "$ROOT"/files/usr/lib/lua/*.lua "root@$ap:/usr/lib/lua/"
 	scp -O -q -o BatchMode=yes "$ROOT/files/usr/bin/apman-status"        "root@$ap:/usr/bin/"
 	scp -O -q -o BatchMode=yes "$ROOT/files/etc/init.d/apman-status"     "root@$ap:/etc/init.d/"
 	scp -O -q -o BatchMode=yes "$ROOT/files/lib/upgrade/keep.d/apman"    "root@$ap:/lib/upgrade/keep.d/"
