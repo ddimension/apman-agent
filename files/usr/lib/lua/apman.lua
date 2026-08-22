@@ -473,7 +473,21 @@ function apman.run_capture(name, command, cb)
 		return
 	end
 	local path = '/tmp/.apman-' .. name
+	-- Started from a zero timer, never directly from the caller.
+	--
+	-- The caller may itself be the completion callback of another
+	-- uloop.process — the station dumps follow the iwinfo run that way — and
+	-- registering a process from inside uloop's own process handling races
+	-- with the SIGCHLD it is in the middle of reaping. The child then exits
+	-- unnoticed and the callback never comes. That is what happened on
+	-- ap-av-grwz after a reboot: both files were written and the second
+	-- callback never arrived.
+	-- The handle must be kept: an anonymous uloop timer is collected before it
+	-- fires, and then nothing happens at all — measured, the fork never ran
+	-- and no output file was created. Every other timer in this agent lives in
+	-- apman.timers for the same reason.
 	local ok = pcall(function()
+	apman.timers['capture_' .. name] = uloop.timer(function()
 		-- braces around the command: without them a list joined with ';'
 		-- redirects only its last member, and the output of everything
 		-- before it is lost. The station dumps are exactly such a list, and
@@ -485,6 +499,10 @@ function apman.run_capture(name, command, cb)
 				if f then f:close() end
 				cb(out)
 			end)
+	-- 1 ms, not 0: uloop does not arm a timeout of zero at all, so the fork
+	-- never happened and no callback ever came. Measured on hardware — a
+	-- direct spawn works, a timer of 0 never fires, a timer of 1 does.
+	end, 1)
 	end)
 	if not ok then
 		cb(apman.getOutput(command))
@@ -553,11 +571,27 @@ function apman.status_cycle()
 	-- collection has become slower than the interval and that is the thing to
 	-- fix, not the symptom.
 	if apman.status_busy then
-		print('status cycle still collecting, skipping this tick')
+		-- A cycle that never finishes must not silence the agent for good.
+		-- Every stage can in principle fail to call back — a ubus answer that
+		-- never comes has its own deadline, a forked child that is never
+		-- reaped does not — and without this the flag stays set and nothing
+		-- is published again. ap-av-grwz spent thirty minutes in that state
+		-- after a reboot: alive, answering RADIUS, and mute, while the
+		-- controller counted it as offline.
+		--
+		-- Three intervals, then the tick goes ahead regardless. A lost cycle
+		-- is a gap in a graph; a stuck flag is an access point that has
+		-- disappeared.
+		local age = socket.gettime() - (apman.status_started or 0)
+		if age < (apman.status_interval / 1000) * 3 then
+			print('status cycle still collecting, skipping this tick')
 
-		return
+			return
+		end
+		print(string.format('status cycle stuck for %.0fs, starting a new one', age))
 	end
 	apman.status_busy = true
+	apman.status_started = socket.gettime()
 
 	local topic, data
 	local devices = apman.conn:call("iwinfo", "devices", {})
