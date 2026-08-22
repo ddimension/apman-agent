@@ -74,20 +74,23 @@ say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 # (hostname, broker, zertifikate), und es zu ueberschreiben haette den AP
 # stillgelegt. Der Keystore unter /etc/apman bleibt ebenfalls unangetastet.
 # --------------------------------------------------------------------------
+# scp braucht -O: OpenWrt bringt keinen sftp-server mit, und seit OpenSSH 9
+# ist sftp der Default. Ohne das Flag bricht jede Uebertragung mit
+# "/usr/libexec/sftp-server: No such file or directory" ab.
 rollout() {
 	local ap="$1" changed_collectd=0
 	say "rollout auf $ap"
 	ssh -o BatchMode=yes "root@$ap" 'mkdir -p /usr/lib/lua /usr/bin /usr/share/collectd /lib/upgrade/keep.d /etc/collectd/conf.d /etc/apman'
-	scp -q -o BatchMode=yes \
+	scp -O -q -o BatchMode=yes \
 		"$ROOT"/files/usr/lib/lua/apman.lua \
 		"$ROOT"/files/usr/lib/lua/apman-collectd.lua \
 		"$ROOT"/files/usr/lib/lua/apman-radius.lua \
 		"root@$ap:/usr/lib/lua/"
-	scp -q -o BatchMode=yes "$ROOT/files/usr/bin/apman-status"        "root@$ap:/usr/bin/"
-	scp -q -o BatchMode=yes "$ROOT/files/etc/init.d/apman-status"     "root@$ap:/etc/init.d/"
-	scp -q -o BatchMode=yes "$ROOT/files/lib/upgrade/keep.d/apman"    "root@$ap:/lib/upgrade/keep.d/"
-	scp -q -o BatchMode=yes "$ROOT/files/usr/share/collectd/types.apman.db" "root@$ap:/usr/share/collectd/"
-	scp -q -o BatchMode=yes "$ROOT/files/etc/collectd/conf.d/lua-apman.conf" "root@$ap:/etc/collectd/conf.d/"
+	scp -O -q -o BatchMode=yes "$ROOT/files/usr/bin/apman-status"        "root@$ap:/usr/bin/"
+	scp -O -q -o BatchMode=yes "$ROOT/files/etc/init.d/apman-status"     "root@$ap:/etc/init.d/"
+	scp -O -q -o BatchMode=yes "$ROOT/files/lib/upgrade/keep.d/apman"    "root@$ap:/lib/upgrade/keep.d/"
+	scp -O -q -o BatchMode=yes "$ROOT/files/usr/share/collectd/types.apman.db" "root@$ap:/usr/share/collectd/"
+	scp -O -q -o BatchMode=yes "$ROOT/files/etc/collectd/conf.d/lua-apman.conf" "root@$ap:/etc/collectd/conf.d/"
 	ssh -o BatchMode=yes "root@$ap" 'chmod 755 /usr/bin/apman-status /etc/init.d/apman-status /usr/lib/lua/apman*.lua'
 
 	# Der Dienst heisst apman-status, nicht apman. Ein `/etc/init.d/apman
@@ -103,7 +106,7 @@ rollout() {
 	if [ "$RUN_TESTS" = 1 ]; then
 		say "$ap: tests"
 		for t in "$ROOT"/tests/*.lua; do
-			scp -q -o BatchMode=yes "$t" "root@$ap:/tmp/"
+			scp -O -q -o BatchMode=yes "$t" "root@$ap:/tmp/"
 			ssh -o BatchMode=yes "root@$ap" "lua /tmp/$(basename "$t")" | sed 's/^/  /'
 		done
 	fi
