@@ -424,7 +424,8 @@ session id) is **ignored** by apman — it calls ubus locally as root. Send the
 session from `properties/session/create` or an empty string.
 
 Requirements, otherwise the message is silently discarded (with a log line):
-`jsonrpc` == `"2.0"`, `method` == `"call"`, `params` is an array.
+`jsonrpc` == `"2.0"`, `method` is one of `"call"`, `"call_async"` or `"ctrl"`,
+`params` is an array.
 
 The response is published **QoS 1, not retained** (it was retained up to agent
 56-1) to `<topic_prefix>ap/<hostname>/command_result`:
@@ -435,6 +436,60 @@ The response is published **QoS 1, not retained** (it was retained up to agent
 
 A command sent to the fleet wide topic is answered by every device on its own
 `command_result` topic.
+
+### Deferred call (`method: "call_async"`, feature `ubus_async`)
+
+```json
+{"jsonrpc":"2.0","id":42,"method":"call_async",
+ "params":["<session>","<ubus object>","<ubus method>",{"<arg>":"<value>"}]}
+```
+
+The same call as `"call"`, answered later. The agent hands the request to its
+event loop and returns to work; the reply arrives on the usual
+`command_result` and `command_result/<id>` topics, with the same `id` and an
+extra `"async": true`.
+
+**Why this exists.** `"call"` blocks the agent. The Lua ubus binding's
+synchronous invoke runs its own event loop until the answer comes, so for the
+whole duration nothing else in the process runs — not the MQTT client, not the
+hostapd control channel monitors, and not the on-AP RADIUS server. Measured on
+ap-av-attic on 2026-08-22: a `file exec` of `sleep 5`, sent while staggering
+management activation, froze the agent from 03:58:12 to 03:58:17. With
+`macaddr_acl=2` every station that tried to associate in those five seconds was
+turned away, because nobody answered.
+
+**When to use which.** `"call"` is still the right default and is deliberately
+left blocking: inside a bulk the commands run in the order they were sent, and
+that order is load bearing — `uci add`, `uci commit`, `reload` is a sequence,
+not a set. Use `"call_async"` for a call whose result you want but whose
+duration you do not want to impose on everything else, and never for one that
+another command in the same batch depends on.
+
+**Ordering.** A deferred call carries no ordering guarantee, not even against
+other deferred calls. In a bulk, deferred entries are collected as they land
+and the batch result is published once the last one is in, so the batch still
+answers exactly once.
+
+**Errors and deadlines.** A failed lookup or invoke answers immediately with
+the usual error object. A call that never gets an answer is aborted after the
+connection's ubus timeout (30 s by default) and answers with ubus status 7,
+`timeout` — the synchronous path has the same deadline.
+
+**Requires `libubus-lua-async`**, which provides `libubus-lua`. Without it the
+agent still accepts the method, but runs the call synchronously and answers
+before returning — correct, just not deferred. Check the `ubus_async` feature
+flag on `properties/agent`; the agent version says nothing about it, because
+the binding is a separate package.
+
+That package builds against one libubus ABI and the device carries another
+until it is reflashed: the fleet runs `libubus.so.20251202` while the current
+release tree builds `libubus.so.20260628`, so the module cannot be dropped onto
+a running access point — it arrives with a sysupgrade image. Until then every
+access point reports `ubus_async` as absent and `call_async` behaves like
+`call`.
+
+The agent object (`object: "apman"`, the RADIUS key store) rejects this method:
+it is answered from memory and has nothing to wait for.
 
 ### hostapd control channel (`method: "ctrl"`, agent ≥ 56-3)
 

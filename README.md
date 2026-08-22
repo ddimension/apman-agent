@@ -82,7 +82,7 @@ version, all below `<topic_prefix>ap/<hostname>/`:
 | `device/hostapd/<dev>/status` | no | info, clients, assoclist, stations, device and ap status |
 | `hostapd/status` | no | BSS/radio/MLD topology (ucode hostapd only) |
 | `wireless/status` | no | `ubus call network.wireless status` |
-| `command`, `command/bulk` | — | Subscribed; JSON-RPC requests |
+| `command`, `command/bulk` | — | Subscribed; JSON-RPC requests (`call`, `call_async`, `ctrl`) |
 | `command_result`, `command_result/bulk` | no / yes | JSON-RPC responses (`command_result` and `command_result/<id>` are not retained, `/bulk` is) |
 
 `<topic_prefix>command` (without the `ap/<hostname>/` part) is a fleet-wide

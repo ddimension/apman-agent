@@ -571,6 +571,43 @@ end
 
 function apman.connect_ubus()
 	apman.conn = ubus.connect()
+	-- libubus-lua-async adds call_async; the stock binding has only call.
+	-- Detected rather than assumed, because an access point that has not been
+	-- upgraded yet must keep working — every async path below falls back to
+	-- the blocking call when this is false.
+	apman.have_ubus_async = apman.conn ~= nil
+		and type(apman.conn.call_async) == 'function'
+end
+
+-- One ubus call, without stopping the world if we can help it.
+--
+-- The stock binding's conn:call() runs ubus_invoke(), which spins its own
+-- event loop until the answer arrives — so everything else this process is
+-- doing waits, including the RADIUS server that shares the loop. call_async
+-- hands the request to uloop and returns; cb(result, status) runs later.
+--
+-- Without the async binding the callback runs inline, before this returns.
+-- Callers must therefore not assume it runs later, only that it runs once.
+function apman.ubus_call(object, method, args, cb)
+	if apman.conn == nil then
+		cb(nil, 7)
+		return false
+	end
+	args = args or {}
+	if apman.have_ubus_async then
+		local ok, status = apman.conn:call_async(object, method, args, cb)
+		if ok then
+			return true
+		end
+		-- the lookup or the invoke itself failed; there will be no callback
+		cb(nil, status or 6)
+
+		return false
+	end
+	local result, status = apman.conn:call(object, method, args)
+	cb(result, status or 0)
+
+	return false
 end
 
 function apman.mqtt_log(level, message)
@@ -705,22 +742,31 @@ function apman.subscribe_ubus()
 	if type(devices) == 'table' and type(devices['devices']) == 'table' then
 		devlist = devices['devices']
 	end
+	-- Two calls per bss, and every one of them used to block. A resubscribe
+	-- happens after every wifi reload, and an access point here carries a
+	-- dozen bsses — that was two dozen blocking calls in a row while nothing
+	-- else in this process could run. Each result is published on its own and
+	-- nothing here depends on the order, so they all go out at once and
+	-- publish as they land.
 	for key, value in pairs(devlist) do
-		local rrm = apman.conn:call("hostapd."..value, "rrm_nr_get_own", {})
-		if type(rrm) == 'table' then
-			topic = apman.ap_topic('properties/hostapd/' .. value .. '/rrm_nr_get_own')
-			-- resubscribes happen often, the neighbour report almost never
-			-- changes: do not republish it every time
-			apman.publish_property( topic , cjson.encode(rrm), 1, true, apman.property_republish)
-		end
+		local iface = value
+		apman.ubus_call("hostapd."..iface, "rrm_nr_get_own", {}, function(rrm)
+			if type(rrm) == 'table' then
+				-- resubscribes happen often, the neighbour report almost
+				-- never changes: do not republish it every time
+				apman.publish_property(apman.ap_topic('properties/hostapd/' .. iface .. '/rrm_nr_get_own'),
+					cjson.encode(rrm), 1, true, apman.property_republish)
+			end
+		end)
 		-- static bss configuration (ssid, encryption, hw mode), ucode
 		-- based hostapd only
 		if available['hostapd'] then
-			local info = apman.conn:call("hostapd", "bss_info", { iface = value })
-			if type(info) == 'table' then
-				topic = apman.ap_topic('properties/hostapd/' .. value .. '/bss_info')
-				apman.publish_property( topic , cjson.encode(info), 1, true, apman.property_republish)
-			end
+			apman.ubus_call("hostapd", "bss_info", { iface = iface }, function(info)
+				if type(info) == 'table' then
+					apman.publish_property(apman.ap_topic('properties/hostapd/' .. iface .. '/bss_info'),
+						cjson.encode(info), 1, true, apman.property_republish)
+				end
+			end)
 		end
 	end
 	-- send session
@@ -965,8 +1011,9 @@ function apman.validate_rpc(cmd)
 	if cmd['jsonrpc'] ~= '2.0' then
 		return { code = 2, message = 'jsonrpc must be "2.0"' }
 	end
-	if cmd['method'] ~= 'call' and cmd['method'] ~= 'ctrl' then
-		return { code = 1, message = 'method must be "call" or "ctrl"' }
+	if cmd['method'] ~= 'call' and cmd['method'] ~= 'ctrl'
+			and cmd['method'] ~= 'call_async' then
+		return { code = 1, message = 'method must be "call", "call_async" or "ctrl"' }
 	end
 	if type(cmd['params']) ~= 'table' then
 		return { code = 2, message = 'params must be an array' }
@@ -1028,6 +1075,49 @@ function apman.execute_rpc(cmd, done)
 	local object, method, args = cmd['params'][2], cmd['params'][3], cmd['params'][4]
 	if type(args) ~= 'table' then
 		args = {}
+	end
+
+	-- The same call, answered later.
+	--
+	-- 'call' stays blocking on purpose: inside a bulk the commands run in the
+	-- order they were sent, and the controller depends on that — uci add, uci
+	-- commit, reload is not a set. A caller that wants a long running call not
+	-- to hold the agent asks for it explicitly, and the answer comes back on
+	-- the same topics with the same id.
+	if cmd['method'] == 'call_async' then
+		if object == 'apman' then
+			response['error'] = { code = 2, message = 'the agent object is answered synchronously',
+				object = object, method = method }
+
+			return response
+		end
+		print(string.format("calling (async) %s %s with %s", object, method, apman.trunc(cjson.encode(args))))
+		apman.ubus_call(object, method, args, function(result, status)
+			if result == nil and type(status) == 'number' and status ~= 0 then
+				response['error'] = {
+					code = status,
+					message = apman.ubus_status_text[status] or 'ubus error',
+					object = object,
+					method = method,
+				}
+				print(string.format("call (async) %s %s failed: %s (%d)",
+					object, method, response['error'].message, status))
+			else
+				response['result'] = result
+				response['ubus_status'] = 0
+				print(string.format("call (async) %s %s ok: %s",
+					object, method, apman.trunc(cjson.encode(result))))
+			end
+			response['ts'] = socket.gettime()
+			response['async'] = true
+			if done ~= nil then
+				done(response)
+			else
+				apman.publish_rpc_response(response)
+			end
+		end)
+
+		return nil
 	end
 	-- the agent's own object: the radius keystore, one complete set per
 	-- ssid, answered with the versions in force (see radius.apply_keys)
@@ -1179,6 +1269,7 @@ function apman.publish_agent()
 	feature('assoclist_device', true)
 	feature('ctrl_proxy', apman_ctrl.enabled and have_unix)
 	feature('radius_psk', apman.radius_active)
+	feature('ubus_async', apman.have_ubus_async)
 	feature('mib', apman_ctrl.enabled and have_unix and apman_ctrl.mib_interval > 0)
 	feature('sta_ctrl', apman_ctrl.enabled and have_unix and apman_ctrl.sta_ctrl_interval > 0)
 	feature('ctrl_events', apman_ctrl.events and apman_ctrl.enabled and have_unix)
