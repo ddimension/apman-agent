@@ -146,6 +146,23 @@ second, measure a ubus round trip from outside the access point and look at the
 tail — p90, p99, and the share above 300 ms, which is roughly where a station
 gives up after three tries on the authentication frame.
 
+A baseline of that, 150 samples of `system board` over the command channel at
+1.1 s intervals (deliberately coprime to the ten second status tick, so the
+samples walk through the cycle instead of always meeting the same phase):
+
+```
+              min   median    p90    p99    max   above 300 ms
+ap-av-grwz   41 ms  127 ms  220 ms  240 ms  437 ms    0.7 %
+ap-av-attic  16 ms  123 ms  213 ms  241 ms  242 ms    0.0 %
+```
+
+Read it with two warnings. **The median is the path, not the agent**: 123
+against 127 ms across two very differently loaded devices is the broker round
+trip and the QoS 1 handshake, and 300 ubus calls made on the devices
+themselves answer in 0.4 and 0.6 ms median. Whoever sees that median fall is
+measuring the network. What differs is where the two stop — 242 against 437 ms.
+And **0.7 % is one sample out of 150**, a baseline rather than a rate.
+
 ### `survey/<ifname>`
 `ubus call iwinfo survey`, published every `survey_interval` seconds (default
 300, `0` disables). Per channel: `mhz`, `noise`, `active_time`, `busy_time`,
