@@ -471,9 +471,31 @@ and the batch result is published once the last one is in, so the batch still
 answers exactly once.
 
 **Errors and deadlines.** A failed lookup or invoke answers immediately with
-the usual error object. A call that never gets an answer is aborted after the
-connection's ubus timeout (30 s by default) and answers with ubus status 7,
-`timeout` — the synchronous path has the same deadline.
+the usual error object. A call that never gets an answer is aborted and
+answers with the same shape as any other failure — nothing about a timeout
+looks special:
+
+```json
+{"jsonrpc":"2.0","id":42,"async":true,
+ "error":{"code":7,"message":"timeout","object":"hostapd.wap-kc0","method":"get_clients"}}
+```
+
+Status 7 is `timeout` and status 4 is `not found`, so the two are told apart by
+the code, not by the shape.
+
+The deadline is the connection's ubus timeout, 30 s, unless the command carries
+its own:
+
+```json
+{"jsonrpc":"2.0","id":42,"method":"call_async","timeout":3,
+ "params":["","hostapd.wap-kc0","get_clients",{}]}
+```
+
+`timeout` is in seconds, clamped to 1–300. Set it when you give up earlier than
+the agent would: otherwise the answer arrives on `command_result/<id>` long
+after you stopped waiting, and a consumer that is still subscribed will see a
+reply to a request it has already written off. Responses are not retained, so
+this only reaches live subscribers — but it does reach them.
 
 **Requires `libubus-lua-async`**, which provides `libubus-lua`. Without it the
 agent still accepts the method, but runs the call synchronously and answers

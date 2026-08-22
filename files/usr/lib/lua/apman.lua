@@ -588,14 +588,17 @@ end
 --
 -- Without the async binding the callback runs inline, before this returns.
 -- Callers must therefore not assume it runs later, only that it runs once.
-function apman.ubus_call(object, method, args, cb)
+-- timeout is in seconds and optional; without it the connection's own applies
+-- (30 s). A caller that gives up earlier than the agent does would otherwise
+-- see an answer arrive long after it stopped waiting.
+function apman.ubus_call(object, method, args, cb, timeout)
 	if apman.conn == nil then
 		cb(nil, 7)
 		return false
 	end
 	args = args or {}
 	if apman.have_ubus_async then
-		local ok, status = apman.conn:call_async(object, method, args, cb)
+		local ok, status = apman.conn:call_async(object, method, args, cb, timeout)
 		if ok then
 			return true
 		end
@@ -1091,7 +1094,15 @@ function apman.execute_rpc(cmd, done)
 
 			return response
 		end
-		print(string.format("calling (async) %s %s with %s", object, method, apman.trunc(cjson.encode(args))))
+		-- the caller may set its own deadline; clamped so a typo cannot pin a
+		-- request open for a day or make it expire before it was sent
+		local timeout = tonumber(cmd['timeout'])
+		if timeout ~= nil then
+			timeout = math.max(1, math.min(300, math.floor(timeout)))
+		end
+		print(string.format("calling (async%s) %s %s with %s",
+			timeout and (' ' .. timeout .. 's') or '', object, method,
+			apman.trunc(cjson.encode(args))))
 		apman.ubus_call(object, method, args, function(result, status)
 			if result == nil and type(status) == 'number' and status ~= 0 then
 				response['error'] = {
@@ -1115,7 +1126,7 @@ function apman.execute_rpc(cmd, done)
 			else
 				apman.publish_rpc_response(response)
 			end
-		end)
+		end, timeout)
 
 		return nil
 	end
