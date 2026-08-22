@@ -1547,8 +1547,13 @@ function apman.refresh_radius_bss_vlans()
 	local iface_map = {}
 	local wireless = apman.conn:call("network.wireless", "status", {})
 	if type(wireless) ~= 'table' then
-		apman.radius_bss_vlans = {}
-		apman.radius_bss_ifaces = {}
+		-- Keep what we have. One hiccup from netifd used to throw the whole
+		-- bssid map away, and until the next refresh — up to five minutes —
+		-- the radius server could not map a single bssid to its uci section.
+		-- Every station associating in that window would have been answered
+		-- with the wrong key or none. A map from five minutes ago is worth
+		-- immeasurably more than an empty one.
+		print('network.wireless status unavailable, keeping the previous bss map')
 		apman.radius_bss_busy = false
 
 		return
