@@ -16,7 +16,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-FEED_DEFAULT="$(dirname "$(dirname "$ROOT")")/ddimension-openwrt-repo"
+FEED_DEFAULT="$(dirname "$ROOT")/ddimension-openwrt-repo"
 
 MSG=""
 DEVS=()
@@ -165,7 +165,7 @@ FEED_MK="$FEED/apman/Makefile"
 [ -f "$FEED_MK" ] || { echo "kein feed-makefile: $FEED_MK" >&2; exit 1; }
 OLD_VER="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "$FEED_MK")"
 NEW_VER=$((OLD_VER + 1))
-SUBDIR="$PKG_NAME-$NEW_VER-$SHORT"
+SUBDIR="$PKG_NAME-$NEW_VER"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
