@@ -21,7 +21,7 @@ local have_radius, apman_radius = pcall(require, 'apman-radius')
 have_radius = have_radius and type(apman_radius) == 'table'
 
 local apman = {}
-apman.version = '56-12'			-- keep in sync with the package Makefile
+apman.version = '59-1'			-- set by contrib/release.sh, do not edit
 apman.started_at = nil
 apman.conn = nil
 apman.hostname = nil
@@ -833,6 +833,7 @@ function apman.subscribe_ubus()
 	topic = apman.ap_topic('properties/session/create')
 	apman.publish_mqtt( topic , cjson.encode(data))
 	apman.publish_agent()
+	apman.publish_radius()
 	-- this also runs after every bss.* change (wifi reloads, hostapd
 	-- restarts): the radius store picks up whatever the config change was
 	-- about, the digest guard keeps the common no-op cheap
@@ -1051,6 +1052,7 @@ function apman.on_mqtt_connect(success, rc, str)
 	apman.publish_mqtt( topic , cjson.encode(data))
 
 	apman.publish_agent()
+	apman.publish_radius()
 
 	if not apman.ubus_subscribed then
 		apman.ubus_subscribed = true
@@ -1564,11 +1566,15 @@ function apman.execute_rpc(cmd, done)
 		elseif method == 'keys' then
 			local result, kerr = apman_radius.apply_keys(apman.radius_server, args)
 			if result == nil then
+				apman_radius.note_error(apman.radius_server, 'key set refused: ' .. tostring(kerr))
 				response['error'] = { code = 4, message = tostring(kerr), object = object, method = method }
 			else
 				response['result'] = result
 				response['ubus_status'] = 0
 			end
+			-- the key set is what the controller changed; say what it did
+			-- to this server before the next status tick would
+			apman.publish_radius()
 		elseif method == 'keys_status' then
 			response['result'] = { versions = apman.radius_server.store.versions or {},
 				source = apman.radius_server.store.source,
@@ -1722,6 +1728,34 @@ function apman.publish_agent()
 		},
 	}
 	apman.publish_property(apman.ap_topic('properties/agent'), cjson.encode(info),
+		1, true, apman.property_republish)
+end
+
+-- The state of the on-ap radius server, retained, so the controller can show
+-- it without asking. Published even when the server is off: "not running, and
+-- here is why" is the answer that matters most, and a topic that simply stays
+-- absent cannot carry it. Same reason the last error is kept after a recovery
+-- — an error that scrolled out of the log never happened, as far as anyone
+-- looking at the fleet later is concerned.
+function apman.publish_radius()
+	local info
+	if apman.radius_active and apman.radius_server ~= nil then
+		local ok, status = pcall(apman_radius.status, apman.radius_server)
+		info = ok and status or { running = true, error = tostring(status) }
+	else
+		info = {
+			running = false,
+			enabled = apman.radius_enabled and true or false,
+			reason = apman.radius_last_error or
+				(apman.radius_enabled and 'not started' or 'not enabled in /etc/config/apman'),
+		}
+	end
+	info.hostname = apman.hostname
+	info.ts = socket.gettime()
+	-- ts changes on every call, so the payload always differs and
+	-- publish_property would lose its point: compare without it
+	local compare = cjson.encode(info)
+	apman.publish_property(apman.ap_topic('properties/radius'), compare,
 		1, true, apman.property_republish)
 end
 
@@ -1886,7 +1920,9 @@ end
 -- one ubus call per tick.
 function apman.radius_reload()
 	if apman.radius_server ~= nil then
-		apman_radius.reload(apman.radius_server)
+		if apman_radius.reload(apman.radius_server) then
+			apman.publish_radius()
+		end
 		local dig = apman.radius_bss_status_digest()
 		apman.radius_bss_ticks = (apman.radius_bss_ticks or 0) + 1
 		-- The status digest reacts to interfaces going up and down, but a
@@ -2293,14 +2329,19 @@ function apman.radius_apply()
 			})
 		end)
 		if not ok then
+			apman.radius_last_error = tostring(server)
 			print(string.format('Radius server failed to start: %s', tostring(server)))
+			apman.publish_radius()
 			return
 		end
 		if server == nil then
+			apman.radius_last_error = tostring(err)
 			print(string.format('Radius server not started: %s', tostring(err)))
+			apman.publish_radius()
 		else
 			apman.radius_server = server
 			apman.radius_active = true
+			apman.radius_last_error = nil
 			apman.refresh_radius_bss_vlans()
 			print(string.format('Radius server listening on %s:%d, %d keys from %s.',
 				apman.radius_bind, apman.radius_port,
@@ -2311,6 +2352,7 @@ function apman.radius_apply()
 		apman.radius_server = nil
 		apman.radius_active = false
 		print('Radius server stopped.')
+		apman.publish_radius()
 	end
 end
 

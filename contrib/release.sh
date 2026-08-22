@@ -119,9 +119,22 @@ if [ "$ONLY_DEV" = 1 ]; then
 fi
 
 # --------------------------------------------------------------------------
-# 1. Commit hier
+# 1. Versionszeichenkette, dann Commit
+#
+# apman.version steht in der Quelle und wurde bisher von Hand gepflegt — sie
+# war prompt zwei Releases hinterher. Sie muss VOR dem Commit stimmen, denn
+# der Commit ist es, aus dem der Tarball und damit der Hash entsteht.
 # --------------------------------------------------------------------------
+FEED_MK="$FEED/apman/Makefile"
+[ -f "$FEED_MK" ] || { echo "kein feed-makefile: $FEED_MK" >&2; exit 1; }
+OLD_VER="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "$FEED_MK")"
+NEW_VER=$((OLD_VER + 1))
+
 cd "$ROOT"
+sed -i "s|^apman.version = '[^']*'|apman.version = '$NEW_VER-1'|" files/usr/lib/lua/apman.lua
+grep -q "^apman.version = '$NEW_VER-1'" files/usr/lib/lua/apman.lua || {
+	echo "apman.version liess sich nicht setzen" >&2; exit 1; }
+
 if [ -n "$(git status --porcelain)" ]; then
 	[ -n "$MSG" ] || { echo "offene aenderungen, aber keine -m nachricht" >&2; exit 1; }
 	say "commit"
@@ -170,10 +183,6 @@ fi
 # --------------------------------------------------------------------------
 say "mirror-hash berechnen"
 PKG_NAME=apman
-FEED_MK="$FEED/apman/Makefile"
-[ -f "$FEED_MK" ] || { echo "kein feed-makefile: $FEED_MK" >&2; exit 1; }
-OLD_VER="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "$FEED_MK")"
-NEW_VER=$((OLD_VER + 1))
 SUBDIR="$PKG_NAME-$NEW_VER"
 
 TMP="$(mktemp -d)"

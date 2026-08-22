@@ -752,13 +752,36 @@ function radius.store_count(store)
 end
 
 -- process one datagram: verify, decide, answer, report.
+-- One place for "something went wrong in here", so the controller sees the
+-- newest one instead of nothing. Not a log: a log on an access point is read
+-- when somebody already suspects this server.
+function radius.note_error(server, message)
+	server.stats.errors = server.stats.errors + 1
+	server.stats.last_error = { ts = server.gettime(), message = tostring(message) }
+end
+
 function radius.handle(server, data, ip, port)
+	local t0 = server.gettime()
 	local function report(event)
+		-- every path through handle() reports exactly once, so this is the
+		-- one place that sees each request end. The duration goes into the
+		-- event as well: the controller stores it as duration_ms, which was
+		-- NULL for every agent answered request until now.
+		local ms = (server.gettime() - t0) * 1000
+		local st = server.stats
+		st.time_n = st.time_n + 1
+		st.time_sum = st.time_sum + ms
+		if ms > st.time_max then st.time_max = ms end
+		event.ms = ms
+		st.last = { ts = event.ts, mac = event.mac, ssid = event.ssid,
+			decision = event.decision, reason = event.reason,
+			key = event.key, key_source = event.key_source, ms = ms }
 		if server.opts.onevent ~= nil then
 			-- the answer is already written: a hiccup in the event sink
 			-- (mqtt reconnect, serialisation) must not kill the server
 			local ok, err = pcall(server.opts.onevent, event)
 			if not ok then
+				radius.note_error(server, 'event sink: ' .. tostring(err))
 				-- diagnostic: the caller discards this, so a failing
 				-- event sink stays invisible without it
 				local df = io.open('/tmp/radius-events.log', 'a')
@@ -965,6 +988,7 @@ function radius.reload(server)
 	-- bad sections are skipped one by one (the loaders count them); an
 	-- empty result on top of a filled store is the torn write case
 	if radius.store_count(next_store) == 0 and radius.store_count(server.store) > 0 then
+		radius.note_error(server, 'key sources unreadable, kept the previous store')
 		print('radius key sources unreadable right now, keeping the previous store')
 		return false
 	end
@@ -975,8 +999,14 @@ function radius.reload(server)
 		end
 		print('radius bad section (skipped): ' .. detail)
 	end
+	if #next_store.error_lines > 0 then
+		radius.note_error(server, string.format('%d unusable key section(s), newest: %s',
+			#next_store.error_lines, next_store.error_lines[1]))
+	end
 	server.store_digest = digest
 	server.store = next_store
+	server.stats.reloads = server.stats.reloads + 1
+	server.stats.last_reload = server.gettime()
 	print(string.format('radius keys reloaded: %d keys (%s)',
 		radius.store_count(server.store), next_store.source))
 	return true
@@ -1015,7 +1045,14 @@ function radius.start(opts)
 		opts = opts,
 		secret = opts.secret,
 		store = radius.load_store(opts),
-		stats = { accepted = 0, rejected = 0, dropped = 0 },
+		-- Everything a controller can ask about this server without a
+		-- second round trip. The counters are cheap; what earns its place
+		-- is last_error, because a radius server that answers nothing looks
+		-- exactly like one nobody asked, and the difference decides whether
+		-- somebody has to drive out to the site.
+		stats = { accepted = 0, rejected = 0, dropped = 0, errors = 0,
+			reloads = 0, started = socket.gettime(),
+			time_n = 0, time_sum = 0, time_max = 0 },
 		gettime = socket.gettime,
 	}
 	server.store_digest = tohex(md5((readfile(opts.wifi_config) or '') .. '\0' ..
@@ -1036,6 +1073,40 @@ function radius.start(opts)
 	end
 
 	return server
+end
+
+-- What the controller shows on its RADIUS page. Flat on purpose: it is read
+-- by a template, and a template that has to reach three levels deep gets the
+-- reaching wrong on the day the field is missing.
+function radius.status(server)
+	local st = server.stats
+	local versions = {}
+	for name, v in pairs(server.store.versions or {}) do versions[name] = v end
+	return {
+		running = true,
+		bind = server.opts.bind or '127.0.0.1',
+		port = server.opts.port or 1812,
+		started = st.started,
+		reload_interval = server.opts.reload_interval or 10,
+		store = {
+			source = server.store.source,
+			keys = radius.store_count(server.store),
+			ssids = versions,
+			reloads = st.reloads,
+			last_reload = st.last_reload,
+		},
+		stats = {
+			accepted = st.accepted,
+			rejected = st.rejected,
+			dropped = st.dropped,
+			errors = st.errors,
+			requests = st.time_n,
+			avg_ms = st.time_n > 0 and (st.time_sum / st.time_n) or nil,
+			max_ms = st.time_n > 0 and st.time_max or nil,
+		},
+		last = st.last,
+		last_error = st.last_error,
+	}
 end
 
 function radius.stop(server)
