@@ -23,6 +23,7 @@ DEVS=()
 FEED="${APMAN_FEED_REPO:-$FEED_DEFAULT}"
 PUSH=1
 ONLY_DEV=0
+NO_RELEASE=0
 FEED_PUSH=0
 RUN_TESTS=0
 
@@ -36,6 +37,11 @@ Usage: contrib/release.sh [optionen]
                          Kopiert genau das, was das Paket installiert, ausser
                          /etc/config/apman (conffile) — und startet neu.
       --only-dev         Nur ausrollen. Kein Commit, kein Feed, kein Push.
+      --no-release       Committen und pushen, aber KEIN Release: die Version
+                         bleibt stehen, der Feed wird nicht angefasst. Fuer
+                         Zwischenstaende, die noch kein Paket werden sollen.
+                         Der Feed zeigt dann bewusst auf einen aelteren Commit
+                         — das ist der Sinn, nicht ein Versehen.
       --feed PATH        Pfad zum Feed-Repo (Default: $FEED_DEFAULT,
                          ueberschreibbar mit APMAN_FEED_REPO)
       --feed-push        Auch das Feed-Repo pushen (Default: nur committen)
@@ -57,6 +63,7 @@ while [ $# -gt 0 ]; do
 		-m|--message) MSG="$2"; shift 2 ;;
 		-d|--dev) DEVS+=("$2"); shift 2 ;;
 		--only-dev) ONLY_DEV=1; shift ;;
+		--no-release) NO_RELEASE=1; shift ;;
 		--feed) FEED="$2"; shift 2 ;;
 		--feed-push) FEED_PUSH=1; shift ;;
 		--no-push) PUSH=0; shift ;;
@@ -125,15 +132,16 @@ fi
 # war prompt zwei Releases hinterher. Sie muss VOR dem Commit stimmen, denn
 # der Commit ist es, aus dem der Tarball und damit der Hash entsteht.
 # --------------------------------------------------------------------------
-FEED_MK="$FEED/apman/Makefile"
-[ -f "$FEED_MK" ] || { echo "kein feed-makefile: $FEED_MK" >&2; exit 1; }
-OLD_VER="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "$FEED_MK")"
-NEW_VER=$((OLD_VER + 1))
-
 cd "$ROOT"
-sed -i "s|^apman.version = '[^']*'|apman.version = '$NEW_VER-1'|" files/usr/lib/lua/apman.lua
-grep -q "^apman.version = '$NEW_VER-1'" files/usr/lib/lua/apman.lua || {
-	echo "apman.version liess sich nicht setzen" >&2; exit 1; }
+if [ "$NO_RELEASE" = 0 ]; then
+	FEED_MK="$FEED/apman/Makefile"
+	[ -f "$FEED_MK" ] || { echo "kein feed-makefile: $FEED_MK" >&2; exit 1; }
+	OLD_VER="$(sed -n 's/^PKG_VERSION:=\(.*\)$/\1/p' "$FEED_MK")"
+	NEW_VER=$((OLD_VER + 1))
+	sed -i "s|^apman.version = '[^']*'|apman.version = '$NEW_VER-1'|" files/usr/lib/lua/apman.lua
+	grep -q "^apman.version = '$NEW_VER-1'" files/usr/lib/lua/apman.lua || {
+		echo "apman.version liess sich nicht setzen" >&2; exit 1; }
+fi
 
 if [ -n "$(git status --porcelain)" ]; then
 	[ -n "$MSG" ] || { echo "offene aenderungen, aber keine -m nachricht" >&2; exit 1; }
@@ -149,6 +157,15 @@ URL="$(git config --get remote.origin.url)"
 # Der Feed laedt ueber https, auch wenn hier ssh konfiguriert ist.
 HTTPS_URL="$(echo "$URL" | sed -e 's|^git@github.com:|https://github.com/|' -e 's|\.git$||')"
 
+if [ "$PUSH" = 1 ] && [ "$NO_RELEASE" = 1 ]; then
+	say "push (ohne release)"
+	git push origin HEAD
+	for ap in "${DEVS[@]:-}"; do [ -n "$ap" ] && rollout "$ap"; done
+	say "fertig"
+	echo "  agent:  $SHORT"
+	echo "  kein release — der feed pinnt weiterhin $(sed -n 's/^PKG_SOURCE_VERSION:=\(........\).*/\1/p' "$FEED/apman/Makefile" 2>/dev/null)"
+	exit 0
+fi
 if [ "$PUSH" = 1 ]; then
 	say "push"
 	git push origin HEAD
