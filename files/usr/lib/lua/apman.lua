@@ -29,7 +29,7 @@ local have_syslog, apman_syslog = pcall(require, 'apman-syslog')
 have_syslog = have_syslog and type(apman_syslog) == 'table'
 
 local apman = {}
-apman.version = '61-1'			-- set by contrib/release.sh, do not edit
+apman.version = '62-1'			-- set by contrib/release.sh, do not edit
 apman.started_at = nil
 apman.conn = nil
 apman.hostname = nil
