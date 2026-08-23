@@ -22,6 +22,11 @@ local have_ctrl, apman_ctrl = pcall(require, 'apman-ctrl')
 have_ctrl = have_ctrl and type(apman_ctrl) == 'table'
 local have_radius, apman_radius = pcall(require, 'apman-radius')
 have_radius = have_radius and type(apman_radius) == 'table'
+-- the system log over the command channel; needs a ubus binding that can hand
+-- out the descriptor 'log read' answers with, so the module reports itself
+-- absent rather than failing when the binding is older
+local have_syslog, apman_syslog = pcall(require, 'apman-syslog')
+have_syslog = have_syslog and type(apman_syslog) == 'table'
 
 local apman = {}
 apman.version = '61-1'			-- set by contrib/release.sh, do not edit
@@ -421,6 +426,16 @@ end
 -- cycle ends; the log line is how that becomes visible.
 function apman.statusCallback()
 	local t0 = socket.gettime()
+	-- The log stream is attached from here rather than once at start up, so
+	-- that it comes back on its own if logd is restarted or if it was
+	-- switched on in uci while the agent was running. start() returns at once
+	-- when it is already attached or not wanted, so this costs a comparison.
+	if have_syslog then
+		pcall(function()
+			apman_syslog.start(apman.conn, cjson)
+			apman.publish_syslog_status()
+		end)
+	end
 	local ok, err = pcall(apman.status_cycle)
 	if not ok then
 		print(string.format('status cycle failed: %s', tostring(err)))
@@ -1667,6 +1682,8 @@ function apman.publish_agent()
 	feature('mib', apman_ctrl.enabled and have_unix and apman_ctrl.mib_interval > 0)
 	feature('sta_ctrl', apman_ctrl.enabled and have_unix and apman_ctrl.sta_ctrl_interval > 0)
 	feature('ctrl_events', apman_ctrl.events and apman_ctrl.enabled and have_unix)
+	feature('syslog', have_syslog and apman_syslog.enabled
+		and type(ubus.read_fd) == 'function' and type(ubus.blob_decode) == 'function')
 
 	local info = {
 		agent = 'apman',
@@ -1720,6 +1737,36 @@ function apman.publish_radius()
 	local compare = cjson.encode(info)
 	info.ts = socket.gettime()
 	apman.publish_property(apman.ap_topic('properties/radius'), cjson.encode(info),
+		1, true, apman.property_republish, compare)
+end
+
+-- What the log stream cost and what it threw away.
+--
+-- Without this the controller sees only what arrived and has no way to tell a
+-- quiet access point from a filter that is eating everything, or to know how
+-- much reading the stream is costing. Same shape as the radius numbers above,
+-- and the same trick: the timestamp goes in after the comparison value is
+-- taken, or every tick would look like a change.
+function apman.publish_syslog_status()
+	if not have_syslog then
+		return
+	end
+	local info = apman_syslog.stats()
+	info.enabled = apman_syslog.enabled and true or false
+	info.kernel = nil			-- the counter, not the switch
+	info.kernel_forwarded = apman_syslog.counters.kernel
+	info.kernel_enabled = apman_syslog.kernel and true or false
+	info.allow_all = apman_syslog.allow_all and true or false
+	local idents = {}
+	for ident in pairs(apman_syslog.allow) do idents[#idents + 1] = ident end
+	table.sort(idents)
+	info.allow = idents
+	info.allow_re = apman_syslog.allow_re
+	info.hostname = apman.hostname
+
+	local compare = cjson.encode(info)
+	info.ts = socket.gettime()
+	apman.publish_property(apman.ap_topic('properties/syslog'), cjson.encode(info),
 		1, true, apman.property_republish, compare)
 end
 
@@ -2240,6 +2287,28 @@ function apman.apply_config()
 		event_allow_drop = apman.cfg_list('ctrl_event_deny', {}),
 		allow_add = apman.cfg_list('ctrl_allow', {}),
 	})
+
+	if have_syslog then
+		apman_syslog.bind({ ap_topic = apman.ap_topic, publish = apman.publish_mqtt,
+				    ubus = ubus, uloop = uloop })
+		local was = apman_syslog.enabled
+		apman_syslog.configure({
+			enabled = apman.cfg_bool('syslog_enabled', false),
+			kernel = apman.cfg_bool('syslog_kernel', true),
+			allow_all = apman.cfg_bool('syslog_all', false),
+			max_text = apman.cfg_num('syslog_max_text', 1024),
+			self_ident = apman.cfg('syslog_self_ident', ''),
+			allow_add = apman.cfg_list('syslog_allow', {}),
+			allow_drop = apman.cfg_list('syslog_deny', {}),
+			allow_re = apman.cfg_list('syslog_allow_re', {}),
+		})
+		-- a switch that was turned off takes effect now rather than at the
+		-- next restart; one that was turned on is picked up by the status
+		-- cycle, which is also what starts it the first time
+		if was and not apman_syslog.enabled then
+			apman_syslog.stop()
+		end
+	end
 	-- the reply socket name has to be unique per process and request
 	local stat = io.open('/proc/self/stat')
 	if stat ~= nil then
