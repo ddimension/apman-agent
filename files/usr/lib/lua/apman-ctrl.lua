@@ -10,6 +10,7 @@
 -- Config values are set by apman.apply_config through ctrl.configure().
 
 local socket = require('socket')
+local parse = require('apman-parse')
 local uloop = require('uloop')
 local cjson = require('cjson')
 local have_unix, unix = pcall(require, "socket.unix")
@@ -335,7 +336,7 @@ function ctrl.event_parse(msg)
 	local event = {
 		event = name,
 		priority = priority and tonumber(priority) or nil,
-		fields = {},
+		fields = {},  -- replaced below; kept so an early return still has it
 		raw = rest,
 		timestamp = socket.gettime(),
 	}
@@ -343,9 +344,10 @@ function ctrl.event_parse(msg)
 	if address ~= nil then
 		event['address'] = string.lower(address)
 	end
-	for key, value in string.gmatch(tail, '([%w_%-]+)=(%S+)') do
-		event['fields'][key] = value
-	end
+	-- apman-parse owns the splitting: since the SAE-over-RADIUS patches a
+	-- value may be quoted and contain spaces, which the old inline gmatch
+	-- could not carry, and a pure function is testable without a device
+	event['fields'] = parse.event_fields(tail)
 
 	return event
 end
