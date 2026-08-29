@@ -173,6 +173,12 @@ ctrl.sta_ctrl_fields = {
 	-- is P-256. sae_rejected_groups is normally empty and is worth seeing when
 	-- it is not - it names the curves the station refused before settling.
 	'auth_alg', 'sae_group', 'sae_rejected_groups',
+	-- the RSN Extension element, hex, whole element including its header.
+	-- What a station *can* do rather than what it did: SAE hash-to-element,
+	-- SAE-PK, protected TWT, secure LTF and secure RTT are capability bits
+	-- inside it. Needs wpad-saeradh2e r3 or later (patch 816); older builds
+	-- report nothing here and the field is simply absent.
+	'rsnxe',
 	'AKMSuiteSelector', 'dot11RSNAStatsSelectedPairwiseCipher',
 	'hostapdWPAPTKState', 'hostapdWPAPTKGroupState', 'hostapdMFPR',
 	'capability', 'listen_interval', 'supported_rates', 'timeout_next',
