@@ -168,6 +168,11 @@ ctrl.sta_ctrl_fields = {
 	-- station that was already associated when the subscriber started would
 	-- never show either of them.
 	'identity', 'sae_password_id',
+	-- how the station authenticated, which the client page shows in words:
+	-- auth_alg 3 is SAE, AKMSuiteSelector 00-0f-ac-9 is FT-SAE, sae_group 19
+	-- is P-256. sae_rejected_groups is normally empty and is worth seeing when
+	-- it is not - it names the curves the station refused before settling.
+	'auth_alg', 'sae_group', 'sae_rejected_groups',
 	'AKMSuiteSelector', 'dot11RSNAStatsSelectedPairwiseCipher',
 	'hostapdWPAPTKState', 'hostapdWPAPTKGroupState', 'hostapdMFPR',
 	'capability', 'listen_interval', 'supported_rates', 'timeout_next',
