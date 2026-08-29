@@ -162,6 +162,12 @@ ctrl.sta_ctrl_fields = {
 	-- keyid names the entry of the wpa_psk_file a station authenticated with,
 	-- which is the only way to tell apart clients that share a wildcard mac
 	'keyid',
+	-- what the SAE-over-RADIUS patches added: the RADIUS User-Name the station
+	-- was admitted under, and the SAE Password Identifier it used. Without
+	-- these two the values reach the controller only in AP-STA-CONNECTED, so a
+	-- station that was already associated when the subscriber started would
+	-- never show either of them.
+	'identity', 'sae_password_id',
 	'AKMSuiteSelector', 'dot11RSNAStatsSelectedPairwiseCipher',
 	'hostapdWPAPTKState', 'hostapdWPAPTKGroupState', 'hostapdMFPR',
 	'capability', 'listen_interval', 'supported_rates', 'timeout_next',

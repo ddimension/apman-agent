@@ -190,9 +190,19 @@ function radius.verify(pkt, data, secret)
 	return true
 end
 
--- the station the query is about: User-Name, falling back to
--- Calling-Station-Id. hostapd sends the bare MAC in both, other sources are
--- tolerated by taking the first 12 hex characters. Called-Station-Id is
+-- the station the query is about: Calling-Station-Id, falling back to
+-- User-Name. hostapd sends the bare MAC in both for a macaddr_acl=2 query, so
+-- the order makes no difference to what this fleet asks today - but it does
+-- to what it may ask next. With sae_password_radius=1 (the SAE-over-RADIUS
+-- patches) hostapd puts the SAE Password Identifier in User-Name and leaves
+-- the station in Calling-Station-Id, and a password identifier is chosen by
+-- whoever is connecting. Reading User-Name first would let one shaped like
+-- twelve hex characters name a *different* station and be answered with that
+-- station's key. Calling-Station-Id is the access point's word for who is
+-- asking; User-Name is the asker's. Take the access point's.
+--
+-- Other sources are tolerated by taking the first 12 hex characters.
+-- Called-Station-Id is
 -- "<bssid>:<ssid>" (add_common_radius_attr), so the event can be attributed
 -- to the bss a controller knows.
 -- Returns mac, bssid (12 lowercase hex), ssid, akm name, raw suite.
@@ -211,7 +221,7 @@ function radius.station(pkt)
 	end
 
 	local mac
-	for _, v in ipairs({ user, csid }) do
+	for _, v in ipairs({ csid, user }) do
 		if type(v) == 'string' then
 			-- a mac is at most 17 characters ('aa:bb:cc:dd:ee:ff'); only the
 			-- hex characters of that window count, so a user name like
