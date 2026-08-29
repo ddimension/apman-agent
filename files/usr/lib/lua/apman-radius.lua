@@ -247,8 +247,12 @@ function radius.station(pkt)
 		end
 	end
 
+	-- the raw User-Name comes back too: for a macaddr_acl=2 query it is the
+	-- station's own address and says nothing new, but with
+	-- sae_password_radius=1 it is the SAE Password Identifier, and only the
+	-- caller can tell which of the two it is looking at
 	return mac, bssid, ssid,
-		AKM_NAMES[suite] or suite and ('0x' .. suite) or nil, suite
+		AKM_NAMES[suite] or suite and ('0x' .. suite) or nil, suite, user
 end
 
 -- encrypt a Tunnel-Password value: tag, two byte salt, then the plaintext
@@ -359,14 +363,17 @@ function radius.load_wireless(path)
 		local bucket = radius.bucket(store, iface)
 		if macs == nil or #macs == 0 then
 			bucket.wildcards[#bucket.wildcards + 1] = entry
+			radius.index_name(bucket, entry, nil)
 			return
 		end
 		for _, mac in ipairs(macs) do
 			local hex = mac:gsub('[^%x]', ''):lower()
 			if hex == '000000000000' then
 				bucket.wildcards[#bucket.wildcards + 1] = entry
+				radius.index_name(bucket, entry, nil)
 			elseif #hex == 12 then
 				bucket.entries[hex] = entry
+				radius.index_name(bucket, entry, hex)
 			else
 				store.errors = store.errors + 1
 				store.error_lines[#store.error_lines + 1] = string.format(
@@ -414,10 +421,74 @@ function radius.load_wireless(path)
 	return store
 end
 
+-- Index one key under its name, and remember which stations it is bound to.
+--
+-- The name is what the controller calls keyid, and it is also what an SAE
+-- Password Identifier is: hostapd with sae_password_radius=1 asks "what is the
+-- password called X", where X is a name out of this very store. Without this
+-- index the store can only answer "what may this MAC use".
+--
+-- The binding is recorded because handing a key out by name has to stay as
+-- narrow as handing it out by address. An entry that names no station is the
+-- onboarding case and may go to whoever asks for it by name; one that is bound
+-- belongs to those stations and to nobody else.
+function radius.index_name(bucket, entry, hex)
+	if type(entry.name) ~= 'string' or entry.name == '' then
+		return
+	end
+	if hex ~= nil then
+		entry.bound = entry.bound or {}
+		entry.bound[hex] = true
+	end
+	bucket.by_name[entry.name] = entry
+end
+
+-- Is this User-Name a Password Identifier, or is it just the station again?
+--
+-- hostapd with sae_password_radius=1 puts the SAE Password Identifier in
+-- User-Name and leaves the station in Calling-Station-Id. In a macaddr_acl=2
+-- query it puts the same address in both. So the two differing is the whole
+-- signal, and there is no new attribute to look for - deliberate on the
+-- hostapd side, because hostap has no private enterprise number.
+--
+-- Returns the identifier, or nil when User-Name is only saying the address
+-- again (or saying nothing).
+function radius.password_id(user, mac)
+	if type(user) ~= 'string' or user == '' then
+		return nil
+	end
+	local as_mac = user:sub(1, 17):gsub('[^%x]', ''):lower()
+	if #as_mac == 12 and as_mac == mac then
+		return nil
+	end
+	return user
+end
+
+-- May the key called `name` go to the station `mac`?
+--
+-- Returns entry, nil on yes; nil, reason on no. A key that names no station is
+-- the onboarding case - the identifier is the only thing its holder has, and
+-- answering is the point. A key that is bound belongs to those stations and to
+-- nobody else: a password identifier is chosen by whoever is connecting, so
+-- answering by name alone would hand a station's key to anyone who guessed it.
+function radius.named_key(bucket, name, mac)
+	if bucket == nil or bucket.by_name == nil then
+		return nil, 'no keys for this bss'
+	end
+	local entry = bucket.by_name[name]
+	if entry == nil then
+		return nil, 'unknown password id'
+	end
+	if entry.bound ~= nil and (mac == nil or not entry.bound[mac]) then
+		return nil, 'belongs to another station'
+	end
+	return entry, nil
+end
+
 function radius.bucket(store, iface)
 	local bucket = store.ifaces[iface]
 	if bucket == nil then
-		bucket = { entries = {}, wildcards = {} }
+		bucket = { entries = {}, wildcards = {}, by_name = {} }
 		store.ifaces[iface] = bucket
 	end
 	return bucket
@@ -475,8 +546,10 @@ function radius.load_keystore(data)
 					local mac = type(k.mac) == 'string' and k.mac:gsub('[^%x]', ''):lower() or ''
 					if #mac == 12 and mac ~= '000000000000' then
 						bucket.entries[mac] = entry
+						radius.index_name(bucket, entry, mac)
 					else
 						bucket.wildcards[#bucket.wildcards + 1] = entry
+						radius.index_name(bucket, entry, nil)
 					end
 				end
 			end
@@ -687,7 +760,7 @@ function radius.handle(server, data, ip, port)
 		})
 	end
 
-	local mac, bssid, ssid, akm, suite = radius.station(pkt)
+	local mac, bssid, ssid, akm, suite, user = radius.station(pkt)
 	-- resolve the wireless interface the request came from and look the key
 	-- up inside it only: a station asking on one SSID must never get the key
 	-- of another (the wildcard of the wrong SSID was answering fleet wide)
@@ -726,8 +799,33 @@ function radius.handle(server, data, ip, port)
 		return e ~= nil and not (sae and #e.psk == 64 and e.psk:match('^%x+$'))
 	end
 
+	-- Is this a Password Identifier query rather than a MAC one?
+	--
+	-- hostapd with sae_password_radius=1 puts the SAE Password Identifier in
+	-- User-Name and leaves the station in Calling-Station-Id. In a
+	-- macaddr_acl=2 query it puts the same address in both. So the two
+	-- differing is the whole signal, and there is no new attribute to look
+	-- for - which was deliberate on the hostapd side: hostap has no PEN.
+	local pw_id = bucket ~= nil and radius.password_id(user, mac) or nil
+
 	local entry, from, wildcards = nil, nil, {}
-	if mac ~= nil and bucket ~= nil then
+	if pw_id ~= nil then
+		-- Answered from the name and from nothing else. hostapd asked what the
+		-- password called X is; a wildcard key or the network passphrase is
+		-- not an answer to that question, and offering one would hand out a
+		-- credential nobody asked for.
+		local named, why = radius.named_key(bucket, pw_id, mac)
+		if named ~= nil and not usable(named) then
+			named, why = nil, 'not usable for SAE'
+		end
+		if named == nil then
+			print(string.format(
+				'radius-error password id %q not answered for %s on ssid=%s: %s',
+				pw_id, mac or '-', tostring(ssid or '-'), why or '?'))
+		else
+			entry, from = named, 'password-id'
+		end
+	elseif mac ~= nil and bucket ~= nil then
 		if usable(bucket.entries[mac]) then
 			entry, from = bucket.entries[mac], 'per-mac'
 		else
