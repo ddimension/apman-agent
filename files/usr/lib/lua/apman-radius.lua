@@ -878,6 +878,19 @@ function radius.handle(server, data, ip, port)
 			type = ATTR_TUNNEL_PASSWORD,
 			value = radius.tunnel_password(entry.psk, server.secret, pkt.auth),
 		}
+		-- Which key answered, by name. hostapd reads User-Name out of an
+		-- Access-Accept into sta->identity (ieee802_11_auth.c, the ACL reply
+		-- handler) and reports it in STA info, so this is what makes
+		-- "identity=660-heinzpixel" appear next to a station instead of
+		-- nothing. Without it the field the hostapd patch adds stays empty and
+		-- looks like the patch is broken, which it is not.
+		--
+		-- 253 is the most an attribute can carry; a key name is far shorter,
+		-- but a truncated one would be a wrong answer rather than a long one.
+		if type(entry.name) == 'string' and entry.name ~= ''
+			and #entry.name <= 253 then
+			attrs[#attrs + 1] = { type = ATTR_USER_NAME, value = entry.name }
+		end
 		-- the vlan trio radius_msg_get_vlanid() decodes back — unless the
 		-- station lives on the bss's own vlan, then hostapd would only put
 		-- it back where it already is
