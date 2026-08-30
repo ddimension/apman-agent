@@ -30,7 +30,7 @@ local have_syslog, apman_syslog = pcall(require, 'apman-syslog')
 have_syslog = have_syslog and type(apman_syslog) == 'table'
 
 local apman = {}
-apman.version = '62-1'			-- set by contrib/release.sh, do not edit
+apman.version = '65-1'			-- set by contrib/release.sh, do not edit
 apman.started_at = nil
 apman.conn = nil
 apman.hostname = nil
@@ -1148,7 +1148,17 @@ function apman.subscribe_ubus()
 		data['timestamp'] = socket.gettime()
 	end
 	topic = apman.ap_topic('properties/session/create')
-	apman.publish_mqtt( topic , cjson.encode(data))
+	-- retained, and compared on the session id rather than on the payload,
+	-- which carries a timestamp. Unretained this was published once per agent
+	-- start and nowhere else: a controller that was not listening in that one
+	-- moment had no session until the agent restarted, and provisioned without
+	-- rollback for as long as that lasted. A retained value is still the right
+	-- one after a reboot, because the agent republishes it here at every start,
+	-- and a session that has died anyway is refused and forgotten by the
+	-- controller on first use.
+	apman.publish_property(topic, cjson.encode(data), 1, true,
+		apman.property_republish,
+		type(data) == 'table' and data['ubus_rpc_session'] or nil)
 	apman.publish_agent()
 	apman.publish_radius()
 	-- this also runs after every bss.* change (wifi reloads, hostapd
