@@ -52,6 +52,7 @@ local radius = {}
 -- is a fast transition or a full reauthentication. lua-md5 does the same hash
 -- in 4 us, so what was left of the fallback was a slow way to fail.
 
+local guard = require('apman-guard')
 local native = require('md5')
 local md5 = native.sum
 radius.native_md5 = true
@@ -1030,9 +1031,12 @@ function radius.start(opts)
 	}
 	server.store_digest = tohex(md5((readfile(opts.wifi_config) or '') .. '\0' ..
 		(readfile(opts.keystore) or '')))
-	server.ufd = uloop.fd_add(sock, function()
+	-- guarded: every RADIUS packet hostapd sends arrives here, parsed from
+	-- the wire. A throw would end uloop and take the whole agent with it, and
+	-- an access point whose RADIUS server is gone admits nobody.
+	server.ufd = uloop.fd_add(sock, guard.wrap('radius.step', function()
 		radius.step(server)
-	end, uloop.ULOOP_READ)
+	end), uloop.ULOOP_READ)
 	if server.ufd == nil then
 		pcall(function() sock:close() end)
 		return nil, 'uloop fd_add failed'
@@ -1040,9 +1044,17 @@ function radius.start(opts)
 	if (opts.reload_interval or 10) > 0 then
 		-- opts.tick lets the host hook its own periodic work (bss map
 		-- refresh) onto the same timer; it must call radius.reload itself
-		server.timer = uloop.timer(function()
+		-- guarded WITH a recover: this timer is re-armed inside reload()
+		-- (radius.reload, the server.timer:set there), so a throw before that
+		-- point would stop the reload cycle for good and the key store would
+		-- silently stop following the controller.
+		server.timer = uloop.timer(guard.wrap('radius.reload', function()
 			if opts.tick ~= nil then opts.tick() else radius.reload(server) end
-		end, (opts.reload_interval or 10) * 1000)
+		end, function()
+			if server.timer ~= nil then
+				server.timer:set((opts.reload_interval or 10) * 1000)
+			end
+		end), (opts.reload_interval or 10) * 1000)
 	end
 
 	return server

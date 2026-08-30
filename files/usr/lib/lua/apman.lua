@@ -17,6 +17,7 @@ have_unix = have_unix and type(unix) == 'table' and type(unix.dgram) == 'functio
 -- the optional minimal radius server (apman-radius.lua) answering hostapd
 -- wpa_psk_radius / sae psk mac queries; the feature reports itself absent
 -- when the module is not installed
+local guard = require('apman-guard')
 local apman_parse = require('apman-parse')
 local have_ctrl, apman_ctrl = pcall(require, 'apman-ctrl')
 have_ctrl = have_ctrl and type(apman_ctrl) == 'table'
@@ -434,6 +435,7 @@ function apman.statusCallback()
 		pcall(function()
 			apman_syslog.start(apman.conn, cjson)
 			apman.publish_syslog_status()
+			apman.publish_guard_status()
 		end)
 	end
 	local ok, err = pcall(apman.status_cycle)
@@ -1747,6 +1749,20 @@ end
 -- much reading the stream is costing. Same shape as the radius numbers above,
 -- and the same trick: the timestamp goes in after the comparison value is
 -- taken, or every tick would look like a change.
+-- What the guard caught, published so a swallowed error is visible.
+--
+-- Catching an error is only better than crashing if somebody can see it
+-- happened. Without this the agent would keep running and quietly lose one
+-- turn of a cycle every time, which is the failure mode this whole guard was
+-- built to avoid — just moved one level up.
+function apman.publish_guard_status()
+	local c = guard.counters()
+	if c.errors == 0 then
+		return		-- nothing to say, and saying it every ten seconds is noise
+	end
+	apman.publish_property(apman.ap_topic('properties/errors'), cjson.encode(c))
+end
+
 function apman.publish_syslog_status()
 	if not have_syslog then
 		return
@@ -2091,10 +2107,31 @@ function apman.init()
 	-- prepare the mqtt client, the connection is established from the timer
 	apman.setup_mqtt()
 
-	apman.timers['ubus_check'] = uloop.timer(apman.ubusCheckCallback)
-	apman.timers['status'] = uloop.timer(apman.statusCallback)
-	apman.timers['subscribe'] = uloop.timer(apman.subscribeCallback)
-	apman.timers['mqtt'] = uloop.timer(apman.mqttCallback)
+	-- Guarded, and every one of them WITH a recover.
+	--
+	-- These four are the agent's clock. Each re-arms its own timer as its last
+	-- statement — the comment above ubusCheckCallback says why: "the poll must
+	-- stay armed or the whole resubscribe machinery dies quietly". Catching an
+	-- error here without putting the timer back would turn a loud crash, which
+	-- procd repairs in ten seconds, into an agent that is running and doing
+	-- nothing. So the recover sets the timer again at its normal interval; the
+	-- cycle loses one turn instead of all of them.
+	local rearm = function(key, ms)
+		return function()
+			if apman.timers[key] ~= nil then
+				apman.timers[key]:set(ms)
+			end
+		end
+	end
+
+	apman.timers['ubus_check'] = uloop.timer(guard.wrap('ubus_check',
+		apman.ubusCheckCallback, rearm('ubus_check', apman.ubus_check_interval)))
+	apman.timers['status'] = uloop.timer(guard.wrap('status',
+		apman.statusCallback, rearm('status', apman.status_interval)))
+	apman.timers['subscribe'] = uloop.timer(guard.wrap('subscribe',
+		apman.subscribeCallback))
+	apman.timers['mqtt'] = uloop.timer(guard.wrap('mqtt',
+		apman.mqttCallback, rearm('mqtt', apman.mqtt_loop_interval)))
 
 	apman.timers['ubus_check']:set(apman.ubus_check_interval)
 	apman.timers['status']:set(apman.status_interval)
@@ -2105,7 +2142,9 @@ function apman.init()
 	-- the controller provisions the radius server by writing /etc/config/
 	-- apman; watch it so no restart is needed to pick the change up
 	if (apman.radius_reload_interval or 10) > 0 then
-		apman.timers['config'] = uloop.timer(apman.configCallback)
+		apman.timers['config'] = uloop.timer(guard.wrap('config',
+			apman.configCallback,
+			rearm('config', apman.radius_reload_interval * 1000)))
 		apman.timers['config']:set(apman.radius_reload_interval * 1000)
 	end
 

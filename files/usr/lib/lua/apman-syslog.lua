@@ -26,6 +26,8 @@
 -- rest is nothing, but a radio restart arrives in a burst, and a line that is
 -- never published costs nothing to carry.
 
+local guard = require('apman-guard')
+
 local syslog = {}
 
 -- filled by the host: ap_topic(sub) -> topic, publish(topic, payload, qos,
@@ -289,7 +291,10 @@ function syslog.start(conn, cjson)
 				return
 			end
 			syslog.fd = fd
-			syslog.ufd = uloop.fd_add(fd, function()
+			-- guarded: this reads a foreign stream and a throw here would end
+			-- uloop, not the read. It stays armed either way — an fd handler is
+			-- not rescheduled by its own callback, so there is nothing to recover
+			syslog.ufd = uloop.fd_add(fd, guard.wrap('syslog.read', function()
 				syslog.counters.reads = syslog.counters.reads + 1
 				local data, why = ubus.read_fd(fd, 8192)
 				if data == nil then
@@ -307,7 +312,7 @@ function syslog.start(conn, cjson)
 						syslog.opts.ap_topic('notifications/syslog'),
 						cjson.encode(entry), 0, false)
 				end)
-			end, uloop.ULOOP_READ)
+			end), uloop.ULOOP_READ)
 			print('syslog: attached to the log stream on descriptor ' .. tostring(fd))
 		end, 10)
 

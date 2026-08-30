@@ -11,6 +11,7 @@
 
 local socket = require('socket')
 local parse = require('apman-parse')
+local guard = require('apman-guard')
 local uloop = require('uloop')
 local cjson = require('cjson')
 local have_unix, unix = pcall(require, "socket.unix")
@@ -303,18 +304,21 @@ function ctrl.request(iface, command, callback)
 		return callback(nil, { code = 13, message = 'send failed: ' .. tostring(err) })
 	end
 
-	ufd = uloop.fd_add(sock, function()
+	-- guarded: hostapd's answer is foreign data, and a throw in here would
+	-- end uloop rather than this request. The deadline timer below still
+	-- fires, so a swallowed error becomes a timeout instead of a dead agent.
+	ufd = uloop.fd_add(sock, guard.wrap('ctrl.reply', function()
 		local reply = sock:receive(65536)
 		if reply == nil then
 			return		-- spurious wakeup, keep waiting for the deadline
 		end
 		finish(reply, nil)
-	end, uloop.ULOOP_READ)
+	end), uloop.ULOOP_READ)
 
-	timer = uloop.timer(function()
+	timer = uloop.timer(guard.wrap('ctrl.timeout', function()
 		finish(nil, { code = 7, message = 'no answer from hostapd within ' ..
 			ctrl.timeout .. ' s' })
-	end, ctrl.timeout * 1000)
+	end), ctrl.timeout * 1000)
 end
 
 -- hostapd answers in "key=value" lines, sometimes with a bare first line (the
@@ -452,9 +456,11 @@ function ctrl.monitor_attach(iface)
 	end
 
 	ctrl.monitors[iface] = { sock = sock, path = path }
-	ctrl.monitors[iface].ufd = uloop.fd_add(sock, function()
+	-- guarded: this is the control channel event stream, the one place where
+	-- every hostapd message this agent forwards passes through unparsed
+	ctrl.monitors[iface].ufd = uloop.fd_add(sock, guard.wrap('ctrl.monitor.' .. iface, function()
 		ctrl.monitor_read(iface)
-	end, uloop.ULOOP_READ)
+	end), uloop.ULOOP_READ)
 	print(string.format('Attached to the control channel of %s', iface))
 
 	return true
