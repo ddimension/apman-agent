@@ -30,7 +30,7 @@ local have_syslog, apman_syslog = pcall(require, 'apman-syslog')
 have_syslog = have_syslog and type(apman_syslog) == 'table'
 
 local apman = {}
-apman.version = '66-1'			-- set by contrib/release.sh, do not edit
+apman.version = '67-1'			-- set by contrib/release.sh, do not edit
 apman.started_at = nil
 apman.conn = nil
 apman.hostname = nil
@@ -1312,6 +1312,14 @@ function apman.connect_mqtt()
 	local ok, errno, err
 
 	apman.mqtt_attempts = apman.mqtt_attempts + 1
+	-- the will belongs to one connection: libmosquitto clears it after the
+	-- connect, so every attempt sets it again. Measured 2026-08-31 on
+	-- ap-av-attic: its connection was a reconnect, the will from the first
+	-- connect was gone, and a reboot went unheard — the broker closed the old
+	-- connection on takeover and published nothing, so the controller never
+	-- learned the access point had gone down.
+	local topic = apman.ap_topic('online')
+	apman.client:will_set(topic, cjson.encode({['status']='offline'}), 1, false)
 	if apman.mqtt_started then
 		ok, errno, err = apman.client:reconnect_async()
 	else
