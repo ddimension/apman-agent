@@ -126,6 +126,23 @@ if [ "$ONLY_DEV" = 1 ]; then
 fi
 
 # --------------------------------------------------------------------------
+# 0. Der Feed muss auf main stehen
+#
+# Der Feed hat zwei Kanaele: main (Entwicklung) und stable (Releases, dorthin
+# nur per scripts/release-stable.sh im Feed). Ein Bump gehoert nach main — mit
+# ausgechecktem stable landete er sonst direkt im Release. Geprueft wird vor
+# allem anderen, damit nichts committet oder gepusht ist, wenn es scheitert.
+# --------------------------------------------------------------------------
+if [ "$NO_RELEASE" = 0 ]; then
+	FEED_BRANCH="$(git -C "$FEED" symbolic-ref --short -q HEAD || true)"
+	if [ "$FEED_BRANCH" != main ]; then
+		echo "feed $FEED steht auf '${FEED_BRANCH:-detached HEAD}', nicht auf main" >&2
+		echo "erst: git -C $FEED switch main" >&2
+		exit 1
+	fi
+fi
+
+# --------------------------------------------------------------------------
 # 1. Versionszeichenkette, dann Commit
 #
 # apman.version steht in der Quelle und wurde bisher von Hand gepflegt — sie
